@@ -16,6 +16,9 @@ from lxml import etree
 
 logger = logging.getLogger(__name__)
 
+# Constants
+MAX_ISSUE_LOG_LENGTH = 50
+
 
 class CorrectionEngine:
     """Apply corrections to a DOCX based on detected differences.
@@ -88,19 +91,19 @@ class CorrectionEngine:
                         logger.debug(
                             "Applied fix for '%s': %s",
                             diff_type,
-                            diff.get("issue", "")[:50],
+                            diff.get("issue", "")[:MAX_ISSUE_LOG_LENGTH],
                         )
                 else:
                     logger.debug(
                         "No handler for difference type '%s': %s",
                         diff_type,
-                        diff.get("issue", "")[:50],
+                        diff.get("issue", "")[:MAX_ISSUE_LOG_LENGTH],
                     )
             except Exception as e:
                 logger.warning(
                     "Failed to apply fix for '%s': %s (error: %s)",
                     diff_type,
-                    diff.get("issue", "")[:50],
+                    diff.get("issue", "")[:MAX_ISSUE_LOG_LENGTH],
                     str(e),
                 )
 
