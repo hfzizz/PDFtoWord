@@ -92,11 +92,32 @@ class AIComparator:
             that page.  Each difference is a dict with ``area``,
             ``issue``, ``type``, and ``severity`` keys.
         """
+        # Input validation
+        if not pdf_images or not docx_images:
+            logger.warning("Empty image lists provided — no comparison possible.")
+            return []
+        
         if not self.is_available:
             logger.warning("Gemini API key not set — skipping AI comparison.")
             return [[] for _ in pdf_images]
 
-        self._init_client()
+        # Validate image files exist
+        import os
+        for i, img_path in enumerate(pdf_images):
+            if not os.path.isfile(img_path):
+                logger.error("PDF image not found: %s (page %d)", img_path, i)
+                return [[] for _ in pdf_images]
+        
+        for i, img_path in enumerate(docx_images):
+            if not os.path.isfile(img_path):
+                logger.error("DOCX image not found: %s (page %d)", img_path, i)
+                return [[] for _ in pdf_images]
+
+        try:
+            self._init_client()
+        except Exception as e:
+            logger.error("Failed to initialize Gemini client: %s", e)
+            return [[] for _ in pdf_images]
 
         results: list[list[dict[str, Any]]] = []
         num_pages = min(len(pdf_images), len(docx_images))
@@ -145,33 +166,61 @@ class AIComparator:
             from google.genai import types
             from PIL import Image
 
-            img_pdf = Image.open(pdf_img_path)
-            img_docx = Image.open(docx_img_path)
+            # Validate images can be opened
+            try:
+                img_pdf = Image.open(pdf_img_path)
+            except Exception as e:
+                logger.error("Failed to open PDF image %s: %s", pdf_img_path, e)
+                return []
+            
+            try:
+                img_docx = Image.open(docx_img_path)
+            except Exception as e:
+                logger.error("Failed to open DOCX image %s: %s", docx_img_path, e)
+                return []
 
-            response = self._client.models.generate_content(
-                model=self.model_name,
-                contents=[
-                    _COMPARISON_PROMPT,
-                    img_pdf,
-                    img_docx,
-                ],
-                config=types.GenerateContentConfig(
-                    max_output_tokens=self.max_tokens,
-                    temperature=0.1,
-                ),
-            )
+            # Make API call with timeout protection
+            try:
+                response = self._client.models.generate_content(
+                    model=self.model_name,
+                    contents=[
+                        _COMPARISON_PROMPT,
+                        img_pdf,
+                        img_docx,
+                    ],
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=self.max_tokens,
+                        temperature=0.1,
+                    ),
+                )
+            except Exception as e:
+                logger.error("Gemini API call failed for page %d: %s", page_num, e)
+                return []
 
             # Track token usage.
             if hasattr(response, "usage_metadata"):
                 usage = response.usage_metadata
-                self._total_tokens += getattr(usage, "total_token_count", 0)
+                tokens = getattr(usage, "total_token_count", 0)
+                self._total_tokens += tokens
+                logger.debug("Page %d used %d tokens.", page_num, tokens)
 
             # Parse JSON from the response text.
             text = response.text or ""
+            if not text:
+                logger.warning("Empty response from Gemini for page %d.", page_num)
+                return []
+            
             return self._parse_response(text, page_num)
 
-        except Exception:
-            logger.exception("AI comparison failed for page %d.", page_num)
+        except ImportError as e:
+            logger.error(
+                "Required package not available: %s. "
+                "Run: pip install google-generativeai Pillow",
+                e
+            )
+            return []
+        except Exception as e:
+            logger.exception("AI comparison failed for page %d: %s", page_num, e)
             return []
 
     @staticmethod
