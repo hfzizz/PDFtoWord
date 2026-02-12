@@ -1,0 +1,14 @@
+{
+  "page_size": "auto",
+  "ocr_enabled": false,
+  "ocr_language": "eng",
+  "preserve_fonts": true,
+  "image_quality": "original",
+  "table_detection": "auto",
+  "heading_detection": "both",
+  "skip_watermarks": false,
+  "verbose": false,
+  "fallback_font": "Arial",
+  "max_image_dpi": 300,
+  "skip_ocr_if_no_tesseract": true
+}
