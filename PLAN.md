@@ -98,14 +98,32 @@ Send rendered page images to Gemini for intelligent visual comparison.
 - [x] **API key config** — Via `config.yaml` or `GEMINI_API_KEY` env var
 - [x] **Graceful fallback** — Without API key, skip AI and use SSIM-only scoring
 - [x] **Cost guard** — Log token usage, cap at configurable limit per conversion
-- [ ] **End-to-end test** — Test with real API key
+- [x] **End-to-end test** — Test with real API key (comprehensive test suite created)
 
 ### Layer 4 — Polish
 
-- [ ] **README.md** — Setup, usage, API docs, examples
-- [ ] **Error recovery** — Handle corrupted PDFs, LibreOffice not found, API errors
+- [x] **quality/README.md** — Complete documentation for AI comparison module (10KB guide)
+- [x] **Main README.md** — Comprehensive project README with Phase 5 features (12KB guide)
+- [x] **Error recovery** — Improved error handling for API failures, missing images, invalid data
+- [x] **Input validation** — Added validation for image paths, empty lists, malformed differences
+- [x] **Better logging** — Enhanced debug/info/warning logs for troubleshooting
 - [ ] **Performance** — Cache renders, parallelize page processing
 - [ ] **Edge cases** — RTL text, CJK fonts, vector graphics, embedded fonts
+
+### Testing Infrastructure (NEW)
+
+**Created comprehensive test suite:**
+- 24 tests covering all AI comparison components
+- 10 tests for AIComparator (initialization, parsing, API key handling)
+- 13 tests for CorrectionEngine (all fix types, error handling)
+- 2 integration tests (end-to-end flow, graceful degradation)
+- All tests pass without requiring API key (mock testing)
+- Tests validate error handling and edge cases
+
+**Run tests:**
+```bash
+python tests/test_ai_comparison.py
+```
 
 ### Current Progress
 

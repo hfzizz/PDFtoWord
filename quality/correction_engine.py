@@ -16,6 +16,9 @@ from lxml import etree
 
 logger = logging.getLogger(__name__)
 
+# Constants
+MAX_ISSUE_LOG_LENGTH = 50
+
 
 class CorrectionEngine:
     """Apply corrections to a DOCX based on detected differences.
@@ -52,35 +55,68 @@ class CorrectionEngine:
         int
             Number of fixes successfully applied.
         """
+        if not differences:
+            logger.debug("No differences to fix.")
+            return 0
+        
         self._fixes_applied = 0
 
+        # Validate input
+        valid_diffs = []
+        for i, diff in enumerate(differences):
+            if not isinstance(diff, dict):
+                logger.warning("Skipping non-dict difference at index %d", i)
+                continue
+            if "type" not in diff:
+                logger.warning("Skipping difference without 'type' field: %s", diff.get("issue", "unknown"))
+                continue
+            valid_diffs.append(diff)
+        
+        if not valid_diffs:
+            logger.warning("No valid differences to fix after validation.")
+            return 0
+
+        logger.info("Applying corrections for %d difference(s).", len(valid_diffs))
+
         # Group by type for batch processing.
-        for diff in differences:
+        for diff in valid_diffs:
             diff_type = diff.get("type", "")
             try:
                 handler = self._handlers.get(diff_type)
                 if handler:
+                    before = self._fixes_applied
                     handler(self, diff)
+                    after = self._fixes_applied
+                    if after > before:
+                        logger.debug(
+                            "Applied fix for '%s': %s",
+                            diff_type,
+                            diff.get("issue", "")[:MAX_ISSUE_LOG_LENGTH],
+                        )
                 else:
                     logger.debug(
                         "No handler for difference type '%s': %s",
                         diff_type,
-                        diff.get("issue", ""),
+                        diff.get("issue", "")[:MAX_ISSUE_LOG_LENGTH],
                     )
-            except Exception:
-                logger.debug(
-                    "Failed to apply fix for '%s': %s",
+            except Exception as e:
+                logger.warning(
+                    "Failed to apply fix for '%s': %s (error: %s)",
                     diff_type,
-                    diff.get("issue", ""),
-                    exc_info=True,
+                    diff.get("issue", "")[:MAX_ISSUE_LOG_LENGTH],
+                    str(e),
                 )
 
         if self._fixes_applied > 0:
-            self._doc.save(self.docx_path)
-            logger.info(
-                "Correction engine: %d fix(es) applied and saved.",
-                self._fixes_applied,
-            )
+            try:
+                self._doc.save(self.docx_path)
+                logger.info(
+                    "Correction engine: %d fix(es) applied and saved.",
+                    self._fixes_applied,
+                )
+            except Exception as e:
+                logger.error("Failed to save corrected document: %s", e)
+                raise
 
         return self._fixes_applied
 
