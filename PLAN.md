@@ -103,10 +103,10 @@ Send rendered page images to Gemini for intelligent visual comparison.
 ### Layer 4 — Polish
 
 - [x] **quality/README.md** — Complete documentation for AI comparison module (10KB guide)
+- [x] **Main README.md** — Comprehensive project README with Phase 5 features (12KB guide)
 - [x] **Error recovery** — Improved error handling for API failures, missing images, invalid data
 - [x] **Input validation** — Added validation for image paths, empty lists, malformed differences
 - [x] **Better logging** — Enhanced debug/info/warning logs for troubleshooting
-- [ ] **Main README.md** — Update root README with Phase 5 features
 - [ ] **Performance** — Cache renders, parallelize page processing
 - [ ] **Edge cases** — RTL text, CJK fonts, vector graphics, embedded fonts
 
