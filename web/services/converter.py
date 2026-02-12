@@ -156,6 +156,16 @@ class ConverterService:
         config["verbose"] = False
 
         password = settings.get("password") or None
+        
+        # AI comparison settings
+        ai_compare = settings.get("ai_compare", False)
+        gemini_api_key = settings.get("gemini_api_key") or None
+        
+        # Store API key in config if provided (for this conversion only)
+        if ai_compare and gemini_api_key:
+            if "ai_comparison" not in config:
+                config["ai_comparison"] = {}
+            config["ai_comparison"]["api_key"] = gemini_api_key
 
         def _progress_callback(
             stage: str, current: int, total: int, message: str
@@ -167,12 +177,23 @@ class ConverterService:
             job.message = message
             # Map to 0-100 percentage.
             if stage == "extracting" and total:
-                job.progress = int(current / total * 70)   # 0-70 %
+                job.progress = int(current / total * 60)   # 0-60 %
             elif stage == "analyzing":
-                job.progress = 75
+                job.progress = 65
             elif stage == "building":
-                job.progress = 85
+                job.progress = 70
             elif stage == "validating":
+                job.progress = 75
+            elif stage == "visual_diff":
+                job.progress = 80
+            elif stage == "ai_compare":
+                # AI comparison rounds: 80-95%
+                base = 80
+                if total > 0:
+                    job.progress = base + int((current / total) * 15)
+                else:
+                    job.progress = base
+            elif stage == "auto_fix":
                 job.progress = 95
             elif stage == "complete":
                 job.progress = 100
@@ -184,6 +205,8 @@ class ConverterService:
                 config,
                 password=password,
                 validate=False,
+                visual_validate=ai_compare,  # Visual diff needed for AI compare
+                ai_compare=ai_compare,
                 progress_callback=_progress_callback,
             )
 

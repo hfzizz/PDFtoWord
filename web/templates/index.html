@@ -61,6 +61,25 @@
               <span>PDF password</span>
               <input type="text" id="settingPassword" placeholder="(leave blank if none)" class="text-input">
             </label>
+            <hr style="margin: 0.75rem 0; border: none; border-top: 1px solid #e0e0e0;">
+            <label class="setting-row">
+              <span>Enable AI Comparison & Auto-correction</span>
+              <input type="checkbox" id="settingAiCompare">
+            </label>
+            <div id="aiKeySection" style="display: none;">
+              <label class="setting-row">
+                <span>Gemini API Key</span>
+                <input type="password" id="settingGeminiKey" placeholder="Enter your Gemini API key" class="text-input">
+              </label>
+              <div class="setting-notice">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align: middle; margin-right: 4px;">
+                  <circle cx="12" cy="12" r="10"/>
+                  <line x1="12" y1="16" x2="12" y2="12"/>
+                  <line x1="12" y1="8" x2="12.01" y2="8"/>
+                </svg>
+                <small>Your API key is only used for this conversion and is not stored. Get your key at <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">Google AI Studio</a>.</small>
+              </div>
+            </div>
           </div>
         </details>
 

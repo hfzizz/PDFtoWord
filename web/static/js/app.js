@@ -91,12 +91,24 @@ convertBtn.addEventListener("click", startConversion);
 
 async function startConversion() {
   if (pendingFiles.length === 0) return;
+  
+  const aiCompareEnabled = document.getElementById("settingAiCompare").checked;
+  const geminiKey = document.getElementById("settingGeminiKey").value.trim();
+  
+  // Validate API key if AI compare is enabled
+  if (aiCompareEnabled && !geminiKey) {
+    alert("Please enter your Gemini API key to use AI Comparison & Auto-correction.");
+    return;
+  }
+  
   convertBtn.disabled = true;
 
   const settings = {
     ocr: document.getElementById("settingOcr").checked,
     skip_watermarks: document.getElementById("settingWatermarks").checked,
     password: document.getElementById("settingPassword").value || undefined,
+    ai_compare: aiCompareEnabled,
+    gemini_api_key: aiCompareEnabled ? geminiKey : undefined,
   };
 
   // Hide empty state.
@@ -354,3 +366,9 @@ function formatSize(bytes) {
 
 // ── Init ────────────────────────────────────────────────────────────
 loadHistory();
+
+// Toggle API key section visibility when AI compare checkbox changes
+document.getElementById("settingAiCompare").addEventListener("change", (e) => {
+  const aiKeySection = document.getElementById("aiKeySection");
+  aiKeySection.style.display = e.target.checked ? "block" : "none";
+});
