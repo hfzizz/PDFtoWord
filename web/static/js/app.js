@@ -97,7 +97,7 @@ async function startConversion() {
   
   // Validate API key if AI compare is enabled
   if (aiCompareEnabled && !geminiKey) {
-    alert("Please enter your Gemini API key to use AI Comparison & Auto-correction.");
+    alert("Please enter your Gemini API key to use AI Comparison & Auto-correction.\n\nGet your key at: https://aistudio.google.com/app/apikey");
     return;
   }
   
