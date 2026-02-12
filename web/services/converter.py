@@ -145,6 +145,17 @@ class ConverterService:
         """Execute the conversion pipeline (runs in a worker thread)."""
         job.status = "running"
         job.message = "Starting conversion…"
+        
+        # Progress tracking constants
+        PROGRESS_EXTRACTION = 60
+        PROGRESS_ANALYZING = 65
+        PROGRESS_BUILDING = 70
+        PROGRESS_VALIDATING = 75
+        PROGRESS_VISUAL_DIFF = 80
+        PROGRESS_AI_COMPARE_BASE = 80
+        PROGRESS_AI_COMPARE_RANGE = 15
+        PROGRESS_AUTO_FIX = 95
+        PROGRESS_COMPLETE = 100
 
         # Build config from job settings.
         config = _load_config()
@@ -155,7 +166,17 @@ class ConverterService:
             config["skip_watermarks"] = True
         config["verbose"] = False
 
-        password = settings.get("password") or None
+        password = settings.get("password")
+        
+        # AI comparison settings
+        ai_compare = settings.get("ai_compare", False)
+        gemini_api_key = settings.get("gemini_api_key")
+        
+        # Store API key in config if provided (for this conversion only)
+        if ai_compare and gemini_api_key:
+            if "ai_comparison" not in config:
+                config["ai_comparison"] = {}
+            config["ai_comparison"]["api_key"] = gemini_api_key
 
         def _progress_callback(
             stage: str, current: int, total: int, message: str
@@ -167,15 +188,25 @@ class ConverterService:
             job.message = message
             # Map to 0-100 percentage.
             if stage == "extracting" and total:
-                job.progress = int(current / total * 70)   # 0-70 %
+                job.progress = int(current / total * PROGRESS_EXTRACTION)
             elif stage == "analyzing":
-                job.progress = 75
+                job.progress = PROGRESS_ANALYZING
             elif stage == "building":
-                job.progress = 85
+                job.progress = PROGRESS_BUILDING
             elif stage == "validating":
-                job.progress = 95
+                job.progress = PROGRESS_VALIDATING
+            elif stage == "visual_diff":
+                job.progress = PROGRESS_VISUAL_DIFF
+            elif stage == "ai_compare":
+                # AI comparison rounds
+                if total > 0:
+                    job.progress = PROGRESS_AI_COMPARE_BASE + int((current / total) * PROGRESS_AI_COMPARE_RANGE)
+                else:
+                    job.progress = PROGRESS_AI_COMPARE_BASE
+            elif stage == "auto_fix":
+                job.progress = PROGRESS_AUTO_FIX
             elif stage == "complete":
-                job.progress = 100
+                job.progress = PROGRESS_COMPLETE
 
         try:
             convert_pdf(
@@ -184,6 +215,8 @@ class ConverterService:
                 config,
                 password=password,
                 validate=False,
+                visual_validate=ai_compare,  # Visual diff needed for AI compare
+                ai_compare=ai_compare,
                 progress_callback=_progress_callback,
             )
 
