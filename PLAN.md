@@ -8,7 +8,8 @@
 | 2 | Enhanced Features (spacing, links, runs, dedup) | ✅ Done |
 | 3 | Advanced (multi-column, OCR, headers/footers, rotation, scoring) | ✅ Done |
 | 4 | Web UI + Quality Fixes (Flask, SSE, table collapsing, merge fix) | ✅ Done |
-| **5** | **Visual Fidelity + AI Comparison** | **← Current** |
+| **5** | **Visual Fidelity + AI Comparison** | **✅ Done** |
+| **6** | **Image & Polish Fixes** | **← Current** |
 
 ---
 
@@ -110,6 +111,120 @@ Send rendered page images to Gemini for intelligent visual comparison.
 - [ ] **Performance** — Cache renders, parallelize page processing
 - [ ] **Edge cases** — RTL text, CJK fonts, vector graphics, embedded fonts
 
+### Layer 5 — AI Correction Loop Fix (Strategy A: Post-Build Patch)
+
+**Status:** Implemented — applies fixes but over-matches (2,323 fixes for 58 diffs). SSIM improves marginally (69% → 70%) then regresses. Kept as a selectable strategy in the web UI.
+
+**Problem:** AI comparator detects 10 differences but correction engine applies 0 fixes. Root causes:
+
+1. **AI prompt doesn't return actionable data** — `area` is a location label (e.g. "header"), not the text content needed to locate the DOCX element. No target/current values for fixes.
+2. **Keyword matching is too fragile** — Handlers look for exact phrases like `"should be bold"` or `"too small"` in free-form AI text. Real AI output uses varied phrasing.
+3. **8 of 14 handlers are stubs/no-ops** — `font_family`, `underline`, `image`, `layout`, `missing_content`, `extra_content` are `lambda: None`; `font_color` just logs; `shading` does `+= 0`.
+4. **Element location matching is broken** — `area in para.text.lower()` checks if "header" appears in paragraph text, not whether the paragraph is in the header area.
+5. **Builder defaults defeat corrections** — Spacing set to `Pt(0)`, Table Grid style already has borders → handlers find nothing to fix.
+
+**Fix Plan (completed):**
+
+- [x] **5a. Rework AI prompt** (`ai_comparator.py`) — Added `text_content`, `expected_value`, `current_value` fields
+- [x] **5b. Update response parser** (`ai_comparator.py`) — Validates and passes through new fields
+- [x] **5c. Rewrite element matching** (`correction_engine.py`) — Fuzzy `text_content` matching
+- [x] **5d. Rewrite fix handlers** — font_size, bold, italic, alignment, spacing use `expected_value`
+- [x] **5e. Implement stub handlers** — font_color, shading, border now functional
+- [x] **5f. Keep intentional no-ops** — image, layout, missing_content, extra_content logged clearly
+- [x] **5g. Verify full loop** — Confirmed fixes applied (2,323 R1, 1,746 R2, 2,321 R3)
+
+**Post-test findings (Strategy A limitations):**
+
+| Round | Diffs | Fixes Applied | SSIM | Tokens Used |
+|-------|-------|---------------|------|-------------|
+| 1 | 58 | 2,323 | 69.0% → 69.2% | 5,666 |
+| 2 | 57 | 1,746 | 69.2% → 70.0% | 5,962 |
+| 3 | 56 | 2,321 | 70.0% → 69.7% ↓ | 5,821 |
+| **Total** | — | **6,390** | **+0.7%** | **~17,500** |
+
+- Over-matching: short `text_content` (<3 chars) → ALL runs modified (40 fixes/diff)
+- Smart quote mismatch: PDF curly quotes vs DOCX straight quotes breaks matching
+- Diminishing returns: same ~57 diffs every round, SSIM oscillates
+- SSIM bottleneck is extraction quality, not post-hoc patching
+
+### Layer 6 — AI-Guided Build (Strategy B: Pre-Build Analysis) ← Current
+
+**Concept:** Instead of building blindly then patching, ask AI to analyze the PDF page ONCE before building. Feed structured formatting data directly into `docx_builder.py` so the DOCX is accurate from the start.
+
+**Why this is better:**
+
+| | Strategy A (Post-Patch) | Strategy B (Pre-Build) |
+|--|------------------------|----------------------|
+| AI calls | 3 (per round) | **1** (before build) |
+| Token cost | ~18K | **~2-3K** |
+| Render cycles | 6 (2 per round) | **2** (1 final validation) |
+| Fix accuracy | Broad (over-matches) | **Precise** (applied during build) |
+| SSIM potential | +1% (ceiling) | **Much higher** (fixes at source) |
+| Time cost | ~90s (3 rounds × render) | **~30s** (1 AI call + build) |
+
+**Implementation Plan:**
+
+- [ ] **6a. Create `AILayoutAnalyzer`** (`quality/ai_layout_analyzer.py`) — New class:
+  - Send PDF page image to Gemini with a layout analysis prompt
+  - Prompt requests structured JSON: per-element font sizes, colors, bold/italic, alignment, cell shading, border styles
+  - Returns a `FormattingSpec` dict keyed by text content → formatting overrides
+  - Single API call per page (~2K tokens)
+
+- [ ] **6b. Layout analysis prompt** — Designed to extract:
+  ```json
+  {
+    "elements": [
+      {
+        "text": "SENARAI AHLI PK",
+        "font_size_pt": 14,
+        "font_color": "#000000",
+        "bold": true,
+        "italic": false,
+        "alignment": "center",
+        "background_color": null
+      },
+      {
+        "text": "BIL",
+        "font_size_pt": 9,
+        "font_color": "#000000",
+        "bold": true,
+        "italic": false,
+        "alignment": "center",
+        "background_color": "#D9E2F3"
+      }
+    ],
+    "table_styles": [
+      {
+        "table_index": 0,
+        "border_style": "thin solid black",
+        "header_row_shading": "#D9E2F3"
+      }
+    ]
+  }
+  ```
+
+- [ ] **6c. Update `docx_builder.py`** — Accept optional `formatting_overrides` dict:
+  - During text run creation, look up text content in overrides
+  - Apply AI-specified font size, color, bold, italic, alignment
+  - For table cells, apply AI-specified shading and border styles
+  - Falls back to PDF-extracted values when no override exists
+
+- [ ] **6d. Update pipeline** (`pdf2docx.py`) — New flow when Strategy B is selected:
+  ```
+  PDF → Render page image → AI Layout Analysis (1 call)
+      → Extract + Build with AI overrides → Render DOCX
+      → SSIM score (validation only, no correction loop)
+  ```
+
+- [ ] **6e. Web UI strategy selector** — Add toggle in the web interface:
+  - "Strategy A: Post-Build Correction" (existing, 3-round loop)
+  - "Strategy B: AI-Guided Build" (new, single pre-build call)
+  - Default to Strategy B when API key is provided
+
+- [ ] **6f. Shared SSIM validation** — Both strategies end with visual diff + SSIM score, just no correction loop for Strategy B
+
+- [ ] **6g. Test & compare** — Run both strategies on same test PDF, compare SSIM + token usage + time
+
 ### Testing Infrastructure (NEW)
 
 **Created comprehensive test suite:**
@@ -150,7 +265,9 @@ python tests/test_ai_comparison.py
 
 ---
 
-## Updated Pipeline (9 stages)
+## Updated Pipeline
+
+### Strategy A — Post-Build Correction (9 stages)
 
 ```
 PDF Input
@@ -168,6 +285,22 @@ PDF Input
   DOCX Output + Quality Report + Diff Images
 ```
 
+### Strategy B — AI-Guided Build (7 stages, recommended)
+
+```
+PDF Input
+  │
+  ├─1─ Render PDF  (PyMuPDF → PNG per page)
+  ├─2─ AI Analyze  (Gemini vision → structured layout spec, 1 call)
+  ├─3─ Extract     (text blocks, images, tables)
+  ├─4─ Build       (DOCX with AI formatting overrides applied)
+  ├─5─ Render DOCX (LibreOffice → PDF → PNG per page)
+  ├─6─ SSIM Score  (per-page validation, no correction loop)
+  ├─7─ Validate    (structure scoring)
+  │
+  DOCX Output + Quality Report + Diff Images
+```
+
 ## Dependencies
 
 ```
@@ -181,7 +314,7 @@ flask>=3.0.0
 
 # Phase 5 — new
 scikit-image>=0.24.0    # SSIM computation
-google-generativeai>=0.8.0  # Gemini API
+google-genai>=1.0.0     # Gemini API (new SDK — google-genai, NOT google-generativeai)
 ```
 
 ## Config (config.yaml additions)
@@ -197,7 +330,8 @@ ai_comparison:
   enabled: false             # Requires API key
   provider: gemini
   model: gemini-2.0-flash
-  max_rounds: 3
+  strategy: B                # A = post-build correction loop, B = pre-build AI-guided
+  max_rounds: 3              # Strategy A only
   max_tokens_per_conversion: 50000
   api_key: ${GEMINI_API_KEY}
 ```
@@ -211,9 +345,71 @@ python pdf2docx.py input.pdf
 # With visual validation
 python pdf2docx.py input.pdf --visual-validate
 
-# With AI comparison (needs GEMINI_API_KEY env var)
-python pdf2docx.py input.pdf --visual-validate --ai-compare
+# With AI comparison — Strategy A (post-build correction loop)
+python pdf2docx.py input.pdf --visual-validate --ai-compare --ai-strategy A
 
-# Web UI
+# With AI comparison — Strategy B (pre-build AI-guided, recommended)
+python pdf2docx.py input.pdf --visual-validate --ai-compare --ai-strategy B
+
+# Web UI (strategy selectable in the interface)
 python -m web.app
 ```
+
+---
+
+## Phase 6 — Image & Polish Fixes
+
+**Goal:** Fix image transparency/background issues and other visual polish items reported during testing.
+
+### Problem 6a — Black Background on Transparent Images
+
+**Symptom:** Logos and icons that have transparent backgrounds in the PDF appear with solid black backgrounds in the converted DOCX.
+
+**Root Cause:** Three contributing factors:
+1. **SMask not composited** — PDF stores transparency as a separate *Soft Mask (SMask)* stream. PyMuPDF's `extract_image(xref)` returns the raw image bytes without compositing the SMask. The alpha channel is lost or misinterpreted.
+2. **RGBA passthrough** — `_ensure_rgb()` treats `RGBA` images as already correct and passes them through. But the alpha channel extracted from PDF may be inverted or absent, causing black fill.
+3. **Word transparency support** — DOCX/Word has inconsistent transparency rendering. Even valid PNGs with alpha may display with dark backgrounds in some renderers.
+
+**Fix (in `extractors/image_extractor.py`):**
+
+| Step | Change | Effect |
+|------|--------|--------|
+| 1 | After `extract_image()`, check for an SMask xref in the image info | Detect if the image has a separate transparency mask |
+| 2 | If SMask exists, read the mask pixmap and create a proper RGBA image | Correctly composite transparency from the PDF structure |
+| 3 | Composite RGBA images onto a white background (`Image.alpha_composite`) | Eliminate transparency — white fill matches typical document backgrounds |
+| 4 | Save all images as PNG (lossless, supports the composited result) | Consistent format, no JPEG artifacts on logos |
+
+**Implementation details:**
+```python
+# In _ensure_rgb() or a new _handle_transparency() method:
+img = Image.open(io.BytesIO(image_bytes))
+
+# If the image has an alpha channel, composite onto white
+if img.mode in ("RGBA", "LA", "PA"):
+    background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+    background.paste(img, mask=img.split()[-1])  # Use alpha as mask
+    img = background.convert("RGB")
+
+# For SMask handling (in extract method):
+smask_xref = img_info[1]  # SMask xref from get_images(full=True)
+if smask_xref > 0:
+    # Read the soft mask and apply it as alpha channel
+    mask_pix = fitz.Pixmap(doc, smask_xref)
+    # ... composite with main image
+```
+
+### Problem 6b — Additional Polish (Backlog)
+
+| Issue | Description | Priority |
+|-------|-------------|----------|
+| Image color profile | Some CMYK images may shift colors during RGB conversion | Medium |
+| Palette images (mode P) | Indexed-color PNGs with transparency index get black fill | Medium |
+| SVG/vector logos | Vector graphics rasterized at low DPI lose quality | Low |
+| Image DPI metadata | Extracted images may lack DPI info, causing size miscalculation | Low |
+
+### Tasks
+
+- [ ] **6a** — Fix transparent image extraction (SMask + alpha compositing)
+- [ ] **6b** — Handle palette (mode P) transparency
+- [ ] **6c** — Improve CMYK → RGB color accuracy
+- [ ] **6d** — Test with various logo types (PNG, JPEG, vector-based)

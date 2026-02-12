@@ -28,12 +28,16 @@ Return ONLY a JSON array.  Each element must be an object with these keys:
 - "type": exactly one of: "font_size", "font_family", "font_color", "bold", "italic",
   "underline", "alignment", "spacing", "border", "shading", "image", "layout", "missing_content", "extra_content"
 - "severity": "high", "medium", or "low"
+- "text_content": the actual text near/at the issue location (first ~50 chars). This is critical for matching to DOCX elements. If no text (e.g. image issue), use empty string.
+- "expected_value": what the value SHOULD be based on the original PDF (e.g., "14pt", "bold", "center", "#FF0000", "1px solid black"). Be specific with units.
+- "current_value": what the value currently IS in the converted DOCX (e.g., "12pt", "normal", "left", "#000000", "no border"). Be specific with units.
 
 If the two images look identical, return an empty array: []
 
 Focus on: fonts, colors, spacing, text alignment, borders, cell shading,
 images (position & size), and overall layout.  Ignore very minor
 anti-aliasing or sub-pixel rendering artifacts.
+Be specific with values — include font sizes in pt, colors as hex codes, alignment as left/center/right/justify.
 """
 
 
@@ -246,6 +250,9 @@ class AIComparator:
                         item.setdefault("area", "unknown")
                         item.setdefault("type", "layout")
                         item.setdefault("severity", "medium")
+                        item.setdefault("text_content", "")
+                        item.setdefault("expected_value", "")
+                        item.setdefault("current_value", "")
                         item["page_num"] = page_num
                         valid.append(item)
                 return valid

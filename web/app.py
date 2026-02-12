@@ -50,10 +50,16 @@ def create_app() -> Flask:
 
 # ── Run directly: python -m web.app ──────────────────────────────────
 if __name__ == "__main__":
+    # Force unbuffered stdout so background-thread print() calls
+    # appear immediately in the terminal.
+    import functools
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
+        force=True,
     )
     application = create_app()
     print("\n  PDF-to-Word Web UI")

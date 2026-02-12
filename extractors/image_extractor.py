@@ -28,23 +28,102 @@ class ImageExtractor:
         self._doc = doc
 
     @staticmethod
-    def _ensure_rgb(image_bytes: bytes, ext: str) -> tuple[bytes, str]:
-        """Convert CMYK or other non-RGB images to RGB PNG using Pillow.
+    def _flatten_to_rgb(img: Image.Image) -> Image.Image:
+        """Flatten any image to RGB, compositing alpha onto white.
+
+        Handles RGBA, LA, PA, P (with transparency), and CMYK modes.
+        Returns an RGB ``Image`` ready for saving.
+        """
+        # Palette images: convert first (may gain an alpha channel).
+        if img.mode == "P":
+            img = img.convert("RGBA")
+
+        # Composite images with alpha onto a white background.
+        if img.mode in ("RGBA", "LA", "PA"):
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
+            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            background.paste(img, mask=img.split()[-1])
+            return background.convert("RGB")
+
+        # CMYK / other exotic modes → RGB.
+        if img.mode != "RGB":
+            return img.convert("RGB")
+
+        return img
+
+    @classmethod
+    def _ensure_rgb(cls, image_bytes: bytes, ext: str) -> tuple[bytes, str]:
+        """Convert image bytes to RGB PNG, compositing transparency onto white.
 
         Returns the (possibly converted) image bytes and the final file
-        extension.
+        extension (always ``"png"``).
         """
         try:
             img = Image.open(io.BytesIO(image_bytes))
-            if img.mode not in ("RGB", "RGBA", "L", "LA", "P"):
-                img = img.convert("RGB")
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                return buf.getvalue(), "png"
-            return image_bytes, ext
+            img = cls._flatten_to_rgb(img)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue(), "png"
         except Exception:
             # If Pillow cannot process the image, return the original bytes.
             return image_bytes, ext
+
+    def _apply_smask(self, xref: int, smask_xref: int,
+                     raw_bytes: bytes) -> bytes:
+        """Apply a PDF Soft Mask (SMask) as an alpha channel.
+
+        Parameters
+        ----------
+        xref : int
+            Xref of the base image.
+        smask_xref : int
+            Xref of the soft-mask image.
+        raw_bytes : bytes
+            Raw bytes of the base image (without mask applied).
+
+        Returns
+        -------
+        bytes
+            PNG bytes of the base image with the SMask applied as alpha
+            and composited onto a white background.
+        """
+        try:
+            base_img = Image.open(io.BytesIO(raw_bytes))
+            if base_img.mode not in ("RGB", "RGBA", "L"):
+                base_img = base_img.convert("RGB")
+            if base_img.mode == "L":
+                base_img = base_img.convert("RGB")
+
+            # Read the soft mask from the PDF.
+            mask_data = self._doc.extract_image(smask_xref)
+            if mask_data and "image" in mask_data:
+                mask_img = Image.open(io.BytesIO(mask_data["image"]))
+                # Ensure mask is grayscale and same size as base.
+                mask_img = mask_img.convert("L")
+                if mask_img.size != base_img.size:
+                    mask_img = mask_img.resize(base_img.size, Image.LANCZOS)
+
+                # Apply mask as alpha channel.
+                if base_img.mode == "RGBA":
+                    # Replace existing alpha with SMask.
+                    r, g, b, _ = base_img.split()
+                    base_img = Image.merge("RGBA", (r, g, b, mask_img))
+                else:
+                    base_img.putalpha(mask_img)
+
+                # Composite onto white.
+                base_img = self._flatten_to_rgb(base_img)
+
+            buf = io.BytesIO()
+            base_img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception:
+            logger.debug(
+                "Failed to apply SMask (xref=%s, smask=%s) — using original.",
+                xref, smask_xref, exc_info=True,
+            )
+            return raw_bytes
 
     def extract(
         self,
@@ -80,6 +159,7 @@ class ImageExtractor:
 
         for idx, img_info in enumerate(image_list):
             xref: int = img_info[0]
+            smask_xref: int = img_info[1] if len(img_info) > 1 else 0
             try:
                 base_image: dict[str, Any] = self._doc.extract_image(xref)
                 if not base_image or "image" not in base_image:
@@ -95,7 +175,18 @@ class ImageExtractor:
                 width: int = base_image.get("width", 0)
                 height: int = base_image.get("height", 0)
 
-                # Ensure the colour space is RGB-compatible
+                # Apply soft mask (SMask) if present — this is how PDFs
+                # store transparency for images like logos.
+                if smask_xref and smask_xref > 0:
+                    logger.debug(
+                        "Applying SMask (xref=%s) to image xref=%s on page %s",
+                        smask_xref, xref, page_num,
+                    )
+                    raw_bytes = self._apply_smask(xref, smask_xref, raw_bytes)
+                    ext = "png"
+
+                # Ensure the colour space is RGB and flatten any remaining
+                # transparency onto a white background.
                 raw_bytes, ext = self._ensure_rgb(raw_bytes, ext)
 
                 # Determine bounding box on the page

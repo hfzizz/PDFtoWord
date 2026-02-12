@@ -164,13 +164,13 @@ class ConverterService:
             config["ocr_enabled"] = True
         if settings.get("skip_watermarks"):
             config["skip_watermarks"] = True
-        config["verbose"] = False
 
         password = settings.get("password")
         
         # AI comparison settings
         ai_compare = settings.get("ai_compare", False)
         gemini_api_key = settings.get("gemini_api_key")
+        ai_strategy = settings.get("ai_strategy", "A")
         
         # Store API key in config if provided (for this conversion only)
         if ai_compare and gemini_api_key:
@@ -203,6 +203,9 @@ class ConverterService:
                     job.progress = PROGRESS_AI_COMPARE_BASE + int((current / total) * PROGRESS_AI_COMPARE_RANGE)
                 else:
                     job.progress = PROGRESS_AI_COMPARE_BASE
+            elif stage == "ai_layout":
+                # Strategy B: AI layout analysis (pre-build)
+                job.progress = PROGRESS_ANALYZING + 2
             elif stage == "auto_fix":
                 job.progress = PROGRESS_AUTO_FIX
             elif stage == "complete":
@@ -217,6 +220,7 @@ class ConverterService:
                 validate=False,
                 visual_validate=ai_compare,  # Visual diff needed for AI compare
                 ai_compare=ai_compare,
+                ai_strategy=ai_strategy,
                 progress_callback=_progress_callback,
             )
 

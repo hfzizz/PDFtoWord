@@ -88,6 +88,7 @@ class DocxBuilder:
         structure_map: List[Dict[str, Any]],
         metadata: Dict[str, Any],
         output_path: str,
+        formatting_overrides: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Build a ``.docx`` file from the given structure map.
 
@@ -103,12 +104,17 @@ class DocxBuilder:
             and ``height`` in PDF points.
         output_path:
             Filesystem path for the generated ``.docx`` file.
+        formatting_overrides:
+            Optional dict of AI-detected formatting overrides
+            (Strategy B).  Recognised sub-keys: ``"text_overrides"``
+            and ``"table_overrides"``.
 
         Returns
         -------
         str
             The absolute path to the saved document.
         """
+        self._formatting_overrides: Dict[str, Any] = formatting_overrides or {}
         self._skipped = 0
         self._setup_document(metadata, structure_map)
 
@@ -265,6 +271,44 @@ class DocxBuilder:
         r_pr.set(qn("w:eastAsia"), self._fallback_font)
 
     # ------------------------------------------------------------------
+    # Override helpers
+    # ------------------------------------------------------------------
+
+    def _get_override(self, text: str) -> Dict[str, Any]:
+        """Look up formatting overrides for *text*.
+
+        Returns the override dict if a match is found in
+        ``self._formatting_overrides["text_overrides"]``, otherwise an
+        empty dict.  Matching is case-insensitive and whitespace-stripped;
+        an exact match is tried first, then a prefix match on the first
+        30 characters.
+        """
+        text_overrides: Dict[str, Any] = self._formatting_overrides.get(
+            "text_overrides", {}
+        )
+        if not text_overrides:
+            return {}
+
+        normalized = text.strip().lower()
+        # Build a lookup mapping: normalised key → override value.
+        lookup: Dict[str, Any] = {
+            k.strip().lower(): v for k, v in text_overrides.items()
+        }
+
+        # 1. Exact match.
+        if normalized in lookup:
+            return lookup[normalized]
+
+        # 2. Prefix match (first 30 chars).
+        prefix = normalized[:30]
+        if prefix:
+            for key, value in lookup.items():
+                if key[:30] == prefix:
+                    return value
+
+        return {}
+
+    # ------------------------------------------------------------------
     # Element handlers
     # ------------------------------------------------------------------
 
@@ -295,9 +339,10 @@ class DocxBuilder:
             heading.paragraph_format.space_after = Pt(sa)
 
         formatting: Dict[str, Any] = element.get("formatting", {})
+        override = self._get_override(text) if self._formatting_overrides else {}
         if formatting:
             for run in heading.runs:
-                self._apply_run_formatting(run, formatting)
+                self._apply_run_formatting(run, formatting, override=override)
 
     def _add_paragraph(self, element: Dict[str, Any]) -> None:
         """Add a body paragraph, including multi‑line handling.
@@ -334,6 +379,9 @@ class DocxBuilder:
         if indent_left > 0:
             para.paragraph_format.left_indent = Pt(indent_left)
 
+        # Look up formatting overrides for this paragraph's text.
+        override = self._get_override(text) if self._formatting_overrides else {}
+
         # --- hyperlinks present: split text into plain / link segments ------
         if links:
             sorted_links = sorted(links, key=lambda lk: lk.get("start", 0))
@@ -347,21 +395,21 @@ class DocxBuilder:
                 # Plain text before this link.
                 if start > cursor:
                     run = para.add_run(text[cursor:start])
-                    self._apply_run_formatting(run, formatting)
+                    self._apply_run_formatting(run, formatting, override=override)
 
                 # Hyperlink run.
                 if uri:
                     self._add_hyperlink(para, link_text, uri, formatting)
                 else:
                     run = para.add_run(link_text)
-                    self._apply_run_formatting(run, formatting)
+                    self._apply_run_formatting(run, formatting, override=override)
 
                 cursor = end
 
             # Remaining plain text after the last link.
             if cursor < len(text):
                 run = para.add_run(text[cursor:])
-                self._apply_run_formatting(run, formatting)
+                self._apply_run_formatting(run, formatting, override=override)
             return
 
         if runs_data:
@@ -375,14 +423,15 @@ class DocxBuilder:
                         prev_run.add_break()
                     continue
                 run = para.add_run(run_text)
-                self._apply_run_formatting(run, run_info)
+                run_override = self._get_override(run_text) if self._formatting_overrides else override
+                self._apply_run_formatting(run, run_info, override=run_override)
                 prev_run = run
         else:
             # Fallback: single formatting for the whole paragraph.
             lines = text.split("\n")
             for i, line in enumerate(lines):
                 run = para.add_run(line)
-                self._apply_run_formatting(run, formatting)
+                self._apply_run_formatting(run, formatting, override=override)
                 if i < len(lines) - 1:
                     run.add_break()
 
@@ -517,6 +566,16 @@ class DocxBuilder:
                     para.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 elif h_align == "right":
                     para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+
+                # --- Table overrides: apply header_bg_color if applicable ---
+                table_overrides = self._formatting_overrides.get("table_overrides", [])
+                page_num = element.get("page_num")
+                for t_ovr in table_overrides:
+                    if t_ovr.get("page_num") == page_num:
+                        hdr_bg = t_ovr.get("header_bg_color")
+                        if hdr_bg and header_row and r_idx == 0 and not bg_color:
+                            self._set_cell_shading(cell, hdr_bg)
+                        break
 
                 # If we have per-span runs, use them for rich formatting.
                 cell_runs = cs.get("runs")
@@ -782,12 +841,16 @@ class DocxBuilder:
         self,
         run: Any,
         formatting: Dict[str, Any],
+        override: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Apply font properties from a *formatting* dict to a Run.
 
         Recognised keys: ``font``, ``size``, ``bold``, ``italic``,
         ``color`` (tuple/list of 3 ints for RGB), ``underline``,
         ``strikethrough``.
+
+        When *override* is provided (from AI layout analysis), its
+        values take priority over *formatting* values.
         """
         font_name = formatting.get("font") or self._fallback_font
         run.font.name = font_name
@@ -799,18 +862,33 @@ class DocxBuilder:
             r_fonts = etree.SubElement(r_pr, qn("w:rFonts"))
         r_fonts.set(qn("w:eastAsia"), font_name)
 
-        size = formatting.get("size")
+        # Size: override takes priority.
+        size = None
+        if override and "font_size_pt" in override:
+            size = override["font_size_pt"]
+        elif formatting.get("size") is not None:
+            size = formatting["size"]
         if size is not None:
             try:
                 run.font.size = Pt(float(size))
             except (TypeError, ValueError):
                 logger.debug("Invalid font size '%s'; ignoring.", size)
 
-        bold = formatting.get("bold")
+        # Bold: override takes priority.
+        bold = None
+        if override and "bold" in override:
+            bold = override["bold"]
+        else:
+            bold = formatting.get("bold")
         if bold is not None:
             run.font.bold = bool(bold)
 
-        italic = formatting.get("italic")
+        # Italic: override takes priority.
+        italic = None
+        if override and "italic" in override:
+            italic = override["italic"]
+        else:
+            italic = formatting.get("italic")
         if italic is not None:
             run.font.italic = bool(italic)
 
@@ -824,7 +902,12 @@ class DocxBuilder:
         if strikethrough:
             run.font.strike = True
 
-        color = formatting.get("color")
+        # Color: override takes priority.
+        color = None
+        if override and "font_color" in override:
+            color = override["font_color"]
+        else:
+            color = formatting.get("color")
         if color is not None:
             try:
                 if isinstance(color, (list, tuple)) and len(color) == 3:

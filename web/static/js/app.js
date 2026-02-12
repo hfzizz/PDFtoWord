@@ -109,6 +109,7 @@ async function startConversion() {
     password: document.getElementById("settingPassword").value || undefined,
     ai_compare: aiCompareEnabled,
     gemini_api_key: aiCompareEnabled ? geminiKey : undefined,
+    ai_strategy: aiCompareEnabled ? document.getElementById("settingAiStrategy").value : undefined,
   };
 
   // Hide empty state.

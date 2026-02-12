@@ -38,6 +38,7 @@ from utils.validator import OutputValidator
 from quality.visual_diff import VisualDiff
 from quality.ai_comparator import AIComparator
 from quality.correction_engine import CorrectionEngine
+from quality.ai_layout_analyzer import AILayoutAnalyzer
 
 logger = logging.getLogger("pdf2docx")
 
@@ -226,6 +227,7 @@ def convert_pdf(
     validate: bool = False,
     visual_validate: bool = False,
     ai_compare: bool = False,
+    ai_strategy: str = "A",
     progress_callback: Callable[[str, int, int, str], None] | None = None,
 ) -> str:
     """Run the full conversion pipeline for a single PDF.
@@ -247,6 +249,9 @@ def convert_pdf(
     ai_compare : bool
         If ``True``, use Gemini AI to detect visual differences and
         auto-correct them (requires ``GEMINI_API_KEY``).
+    ai_strategy : str
+        ``"A"`` for post-build correction loop (default),
+        ``"B"`` for pre-build AI-guided layout analysis.
     progress_callback : callable | None
         Optional ``(stage, current, total, message) -> None`` callback
         invoked at each pipeline stage so callers (e.g. Web UI) can
@@ -260,6 +265,11 @@ def convert_pdf(
     def _progress(stage: str, current: int, total: int, message: str) -> None:
         if progress_callback is not None:
             progress_callback(stage, current, total, message)
+
+    # Auto-flushing print so output appears immediately in web server threads.
+    def _print(*args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("flush", True)
+        print(*args, **kwargs)
 
     input_path = os.path.abspath(input_path)
     output_path = os.path.abspath(output_path)
@@ -397,10 +407,49 @@ def convert_pdf(
     logger.info("Structure map: %d elements", len(structure_map))
 
     # ── Stage 4: Build Word document ─────────────────────────────────
+    formatting_overrides: dict[str, Any] = {}
+
+    # Strategy B: AI-guided pre-build analysis
+    if ai_compare and ai_strategy.upper() == "B":
+        ai_config = config.get("ai_comparison", {})
+        api_key = ai_config.get("api_key") or os.environ.get("GEMINI_API_KEY", "")
+        model = ai_config.get("model", "gemini-2.0-flash")
+
+        if api_key:
+            _progress("ai_layout", page_count, page_count,
+                      "AI layout analysis (Strategy B)…")
+            logger.info("Running AI layout analysis (Strategy B)…")
+            try:
+                layout_analyzer = AILayoutAnalyzer(
+                    api_key=api_key, model=model,
+                )
+                formatting_overrides = layout_analyzer.analyze_layout(
+                    input_path, structure_map,
+                    progress_callback=lambda cur, total, msg: _progress(
+                        "ai_layout", cur, total, msg
+                    ),
+                )
+                n_text = len(formatting_overrides.get("text_overrides", {}))
+                n_table = len(formatting_overrides.get("table_overrides", []))
+                logger.info(
+                    "AI layout analysis complete — %d text overrides, "
+                    "%d table overrides",
+                    n_text, n_table,
+                )
+                _print(f"\n  AI layout: {n_text} text overrides, "
+                       f"{n_table} table overrides")
+            except Exception as exc:
+                logger.warning("AI layout analysis failed: %s — "
+                               "proceeding without overrides.", exc)
+        else:
+            logger.warning("Strategy B selected but no API key — "
+                           "building without AI overrides.")
+
     _progress("building", page_count, page_count, "Building Word document…")
     logger.info("Building Word document…")
     builder = DocxBuilder(config)
-    saved_path = builder.build(structure_map, metadata, output_path)
+    saved_path = builder.build(structure_map, metadata, output_path,
+                               formatting_overrides=formatting_overrides or None)
     logger.info("Word document saved → '%s'", saved_path)
 
     # ── Stage 5: Validation (optional) ───────────────────────────────
@@ -411,7 +460,7 @@ def convert_pdf(
         report = validator.quality_score(saved_path, info)
         score = report.get("quality_score", "?")
         level = report.get("quality_level", "?")
-        print(f"\n  Quality: {level} ({score}/100)")
+        _print(f"\n  Quality: {level} ({score}/100)")
         metrics = report.get("metrics", {})
         if metrics:
             logger.info(
@@ -447,16 +496,17 @@ def convert_pdf(
         pdf_pages = vd_result.get("pdf_page_count", 0)
         docx_pages = vd_result.get("docx_page_count", 0)
 
-        print(f"\n  Visual SSIM: {overall_ssim:.1%} ({vd_level})")
+        _print(f"\n  Visual SSIM: {overall_ssim:.1%} ({vd_level})")
         if pdf_pages != docx_pages:
-            print(f"  Page count: PDF={pdf_pages}, DOCX={docx_pages}"
+            _print(f"  Page count: PDF={pdf_pages}, DOCX={docx_pages}"
                   f" (overflow: {docx_pages - pdf_pages} extra pages)")
         for i, s in enumerate(page_scores):
             tag = "[OK]" if s >= 0.95 else "[!!]" if s < 0.85 else "[--]"
-            print(f"    Page {i + 1}: {s:.1%} {tag}")
+            _print(f"    Page {i + 1}: {s:.1%} {tag}")
 
-        # AI comparison + correction loop.
-        if ai_compare and overall_ssim < 0.95:
+        # AI comparison + correction loop (Strategy A only).
+        # Strategy B already applied overrides pre-build; just report SSIM.
+        if ai_compare and overall_ssim < 0.95 and ai_strategy.upper() == "A":
             ai_config = config.get("ai_comparison", {})
             api_key = ai_config.get("api_key") or os.environ.get("GEMINI_API_KEY", "")
             model = ai_config.get("model", "gemini-2.0-flash")
@@ -473,7 +523,7 @@ def convert_pdf(
                         "ai_compare", round_num, max_rounds,
                         f"AI comparison round {round_num}/{max_rounds}…",
                     )
-                    print(f"\n  AI comparison round {round_num}/{max_rounds}…")
+                    _print(f"\n  AI comparison round {round_num}/{max_rounds}…")
 
                     all_diffs = comparator.compare_pages(
                         vd_result["pdf_images"],
@@ -484,15 +534,15 @@ def convert_pdf(
                     flat_diffs = [d for page_diffs in all_diffs for d in page_diffs]
 
                     if not flat_diffs:
-                        print("    No differences detected by AI.")
+                        _print("    No differences detected by AI.")
                         break
 
-                    print(f"    {len(flat_diffs)} difference(s) found.")
+                    _print(f"    {len(flat_diffs)} difference(s) found.")
                     for d in flat_diffs[:5]:
-                        print(f"      [{d.get('severity', '?')}] "
-                              f"{d.get('area', '?')}: {d.get('issue', '?')}")
+                        _print(f"      [{d.get('severity', '?')}] "
+                               f"{d.get('area', '?')}: {d.get('issue', '?')}")
                     if len(flat_diffs) > 5:
-                        print(f"      … and {len(flat_diffs) - 5} more")
+                        _print(f"      … and {len(flat_diffs) - 5} more")
 
                     # Apply corrections.
                     _progress(
@@ -501,23 +551,23 @@ def convert_pdf(
                     )
                     engine = CorrectionEngine(saved_path)
                     fixes = engine.apply_fixes(flat_diffs)
-                    print(f"    Applied {fixes} fix(es).")
+                    _print(f"    Applied {fixes} fix(es).")
 
                     if fixes == 0:
-                        print("    No actionable fixes — stopping loop.")
+                        _print("    No actionable fixes — stopping loop.")
                         break
 
                     # Re-render and re-score.
                     vd_result = vdiff.compare(input_path, saved_path, diff_dir)
                     overall_ssim = vd_result.get("overall_score", 0)
                     vd_level = vd_result.get("quality_level", "red")
-                    print(f"    Updated SSIM: {overall_ssim:.1%} ({vd_level})")
+                    _print(f"    Updated SSIM: {overall_ssim:.1%} ({vd_level})")
 
                     if overall_ssim >= 0.95:
-                        print("    Target SSIM reached!")
+                        _print("    Target SSIM reached!")
                         break
             else:
-                print("  [SKIP] No GEMINI_API_KEY set — skipping AI comparison.")
+                _print("  [SKIP] No GEMINI_API_KEY set — skipping AI comparison.")
 
     # ── Clean up temp images ─────────────────────────────────────────
     try:
@@ -527,7 +577,7 @@ def convert_pdf(
         pass
 
     _progress("complete", page_count, page_count, "Conversion complete")
-    print(f"\n[OK] Conversion complete: {saved_path}")
+    _print(f"\n[OK] Conversion complete: {saved_path}")
     return saved_path
 
 
@@ -642,6 +692,13 @@ def main() -> None:
         action="store_true",
         help="Use AI (Gemini) to detect and fix visual differences (requires GEMINI_API_KEY).",
     )
+    parser.add_argument(
+        "--ai-strategy",
+        type=str,
+        choices=["A", "B"],
+        default="A",
+        help="AI strategy: A = post-build correction loop, B = pre-build AI-guided layout (default: A).",
+    )
 
     args = parser.parse_args()
 
@@ -688,7 +745,8 @@ def main() -> None:
             sys.exit(0)
 
     convert_pdf(input_path, output_path, config, args.password, args.validate,
-                args.visual_validate, args.ai_compare)
+                args.visual_validate, args.ai_compare,
+                ai_strategy=args.ai_strategy)
 
 
 if __name__ == "__main__":

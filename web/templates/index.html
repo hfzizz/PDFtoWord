@@ -71,6 +71,13 @@
                 <span>Gemini API Key</span>
                 <input type="password" id="settingGeminiKey" placeholder="Enter your Gemini API key" class="text-input">
               </label>
+              <div class="setting-row" style="margin-top: 0.5rem;">
+                <span>AI Strategy</span>
+                <select id="settingAiStrategy" class="text-input" style="width: auto; min-width: 180px;">
+                  <option value="B" selected>B — AI-Guided Build (recommended)</option>
+                  <option value="A">A — Post-Build Correction Loop</option>
+                </select>
+              </div>
               <div class="setting-notice">
                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align: middle; margin-right: 4px;">
                   <circle cx="12" cy="12" r="10"/>
