@@ -15,10 +15,14 @@ Usage
 """
 
 import argparse
+import copy
 import glob
 import json
 import logging
 import os
+from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 from typing import Any, Callable
@@ -66,6 +70,21 @@ def _load_config(config_path: str | None = None) -> dict[str, Any]:
         "fallback_font": "Arial",
         "max_image_dpi": 300,
         "skip_ocr_if_no_tesseract": True,
+        "conversion_engine": "custom",
+        "ai_comparison": {
+            "enabled": False,
+            "strategy": "B",
+            "model": "gemini-2.0-flash",
+            "max_rounds": 3,
+        },
+        "quality": {
+            "mode": "basic",
+            "gate": "warn",
+            "min_score": 70,
+            "use_visual": False,
+            "min_visual_ssim": 0.88,
+            "engine_fallback": False,
+        },
     }
     if os.path.isfile(path):
         try:
@@ -215,6 +234,144 @@ def _get_bbox(item: dict[str, Any]) -> tuple[float, float, float, float]:
     )
 
 
+def _convert_with_pdf2docx_library(
+    input_path: str,
+    output_path: str,
+    password: str | None = None,
+    progress_callback: Callable[[str, int, int, str], None] | None = None,
+) -> str:
+    """Convert using the external ``pdf2docx`` library CLI in current env."""
+    exe_name = "pdf2docx.exe" if os.name == "nt" else "pdf2docx"
+    interpreter_dir = Path(sys.executable).resolve().parent
+    candidate = interpreter_dir / exe_name
+    cli_path = str(candidate) if candidate.is_file() else shutil.which("pdf2docx")
+    if not cli_path:
+        raise RuntimeError(
+            "pdf2docx library CLI not found in current environment. "
+            "Install package with: pip install pdf2docx"
+        )
+
+    if progress_callback is not None:
+        progress_callback("building", 0, 1, "Converting with pdf2docx library…")
+
+    cmd = [cli_path, "convert", input_path, output_path]
+    if password:
+        cmd.extend(["--password", password])
+
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=tempfile.gettempdir(),
+    )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        details = stderr or stdout or "Unknown error"
+        raise RuntimeError(f"pdf2docx library conversion failed: {details}")
+
+    if not os.path.isfile(output_path):
+        raise RuntimeError("pdf2docx library finished without producing output DOCX")
+
+    if progress_callback is not None:
+        progress_callback("building", 1, 1, "pdf2docx library conversion complete")
+
+    return output_path
+
+
+def _run_docx_postprocess(docx_path: str, mode: str) -> dict[str, int]:
+    """Run deterministic post-processing fixes on a DOCX file."""
+    if mode == "off":
+        return {
+            "blank_paragraphs_removed": 0,
+            "spacing_clamped": 0,
+            "heading_keep_with_next": 0,
+            "table_autofit_disabled": 0,
+        }
+
+    try:
+        from docx import Document
+        from docx.shared import Pt
+    except Exception:
+        logger.warning("python-docx unavailable; skipping deterministic postprocess.")
+        return {
+            "blank_paragraphs_removed": 0,
+            "spacing_clamped": 0,
+            "heading_keep_with_next": 0,
+            "table_autofit_disabled": 0,
+        }
+
+    doc = Document(docx_path)
+    stats = {
+        "blank_paragraphs_removed": 0,
+        "spacing_clamped": 0,
+        "heading_keep_with_next": 0,
+        "table_autofit_disabled": 0,
+    }
+
+    # 1) Remove excess consecutive empty paragraphs.
+    empty_run = 0
+    for paragraph in list(doc.paragraphs):
+        text = (paragraph.text or "").strip()
+        if text:
+            empty_run = 0
+            continue
+        empty_run += 1
+        if empty_run > 1:
+            element = paragraph._element
+            element.getparent().remove(element)
+            stats["blank_paragraphs_removed"] += 1
+
+    # 2) Clamp extreme paragraph spacing values.
+    for paragraph in doc.paragraphs:
+        para_fmt = paragraph.paragraph_format
+        for attr in ("space_before", "space_after"):
+            val = getattr(para_fmt, attr)
+            if val is not None and getattr(val, "pt", 0) > 24:
+                setattr(para_fmt, attr, Pt(12))
+                stats["spacing_clamped"] += 1
+
+        if mode == "strict" and para_fmt.line_spacing is not None:
+            line_val = para_fmt.line_spacing
+            try:
+                numeric = float(line_val)
+            except (TypeError, ValueError):
+                numeric = None
+            if numeric is not None and numeric > 2.0:
+                para_fmt.line_spacing = 1.5
+                stats["spacing_clamped"] += 1
+
+    # 3) Keep headings with next paragraph to reduce page-break drift.
+    for paragraph in doc.paragraphs:
+        style_name = paragraph.style.name if paragraph.style else ""
+        if style_name.startswith("Heading"):
+            paragraph.paragraph_format.keep_with_next = True
+            stats["heading_keep_with_next"] += 1
+
+    # 4) Stabilize table layout.
+    for table in doc.tables:
+        table.autofit = False
+        stats["table_autofit_disabled"] += 1
+
+    doc.save(docx_path)
+    return stats
+
+
+def _composite_quality_score(
+    base_quality_score: int,
+    visual_ssim: float | None,
+    use_visual: bool,
+) -> int:
+    """Build a deterministic composite quality score (0-100)."""
+    if not use_visual or visual_ssim is None:
+        return int(base_quality_score)
+    visual_score = max(0.0, min(1.0, visual_ssim)) * 100.0
+    # Weight structural quality higher than visual rendering score.
+    blended = (base_quality_score * 0.8) + (visual_score * 0.2)
+    return int(round(max(0.0, min(100.0, blended))))
+
+
 # ------------------------------------------------------------------ #
 #  Core pipeline                                                      #
 # ------------------------------------------------------------------ #
@@ -226,8 +383,10 @@ def convert_pdf(
     password: str | None = None,
     validate: bool = False,
     visual_validate: bool = False,
-    ai_compare: bool = False,
-    ai_strategy: str = "A",
+    ai_enhance: bool = False,
+    ai_strategy: str = "B",
+    ai_compare: bool | None = None,
+    conversion_engine: str = "custom",
     progress_callback: Callable[[str, int, int, str], None] | None = None,
 ) -> str:
     """Run the full conversion pipeline for a single PDF.
@@ -246,12 +405,17 @@ def convert_pdf(
         If ``True``, run validation on the output file.
     visual_validate : bool
         If ``True``, render both documents and compute SSIM scores.
-    ai_compare : bool
-        If ``True``, use Gemini AI to detect visual differences and
-        auto-correct them (requires ``GEMINI_API_KEY``).
+    ai_enhance : bool
+        If ``True``, enable AI-powered enhancement steps (requires
+        ``GEMINI_API_KEY``).
     ai_strategy : str
-        ``"A"`` for post-build correction loop (default),
-        ``"B"`` for pre-build AI-guided layout analysis.
+        ``"A"`` for post-build correction loop,
+        ``"B"`` for pre-build AI-guided layout analysis (default).
+    ai_compare : bool | None
+        Deprecated alias for ``ai_enhance`` (kept for compatibility).
+    conversion_engine : str
+        ``"custom"`` for this project's pipeline, ``"pdf2docx_lib"`` to use
+        the external ``pdf2docx`` library converter.
     progress_callback : callable | None
         Optional ``(stage, current, total, message) -> None`` callback
         invoked at each pipeline stage so callers (e.g. Web UI) can
@@ -274,6 +438,30 @@ def convert_pdf(
     input_path = os.path.abspath(input_path)
     output_path = os.path.abspath(output_path)
     logger.info("Converting '%s' → '%s'", input_path, output_path)
+
+    if ai_compare is not None:
+        ai_enhance = ai_enhance or ai_compare
+    conversion_engine = (conversion_engine or "custom").lower()
+    if conversion_engine not in {"custom", "pdf2docx_lib"}:
+        logger.warning("Unknown conversion_engine '%s'; falling back to custom.",
+                       conversion_engine)
+        conversion_engine = "custom"
+
+    quality_cfg = config.get("quality", {}) or {}
+    quality_mode = str(quality_cfg.get("mode", "basic")).lower()
+    quality_gate = str(quality_cfg.get("gate", "warn")).lower()
+    quality_min_score = int(quality_cfg.get("min_score", 70))
+    quality_use_visual = bool(quality_cfg.get("use_visual", False))
+    quality_min_visual_ssim = float(quality_cfg.get("min_visual_ssim", 0.88))
+    quality_engine_fallback = bool(quality_cfg.get("engine_fallback", False))
+
+    if quality_mode not in {"off", "basic", "strict"}:
+        quality_mode = "basic"
+    if quality_gate not in {"off", "warn", "fail"}:
+        quality_gate = "warn"
+
+    if quality_use_visual and not visual_validate:
+        visual_validate = True
 
     if not os.path.isfile(input_path):
         logger.error("Input file not found: '%s'", input_path)
@@ -310,158 +498,199 @@ def convert_pdf(
 
     page_count = doc.page_count
     progress = ProgressTracker(total=page_count, description="Extracting pages")
+    temp_dir: str | None = None
+    saved_path: str | None = None
 
-    # ── Stage 1: Extract metadata ────────────────────────────────────
-    _progress("analyzing", 0, page_count, "Extracting metadata…")
-    meta_extractor = MetadataExtractor()
-    metadata = meta_extractor.extract(doc)
+    # Fast path: use external pdf2docx library converter.
+    if conversion_engine == "pdf2docx_lib":
+        if ai_enhance and ai_strategy.upper() == "B":
+            logger.warning(
+                "Strategy B requires custom pipeline analysis; using library engine "
+                "without Strategy B pre-build overrides."
+            )
+        _progress("building", page_count, page_count,
+                  "Building Word document with pdf2docx library…")
+        progress.close()
+        doc.close()
+        saved_path = _convert_with_pdf2docx_library(
+            input_path,
+            output_path,
+            password=password,
+            progress_callback=lambda stage, current, total, message: _progress(
+                stage, current, total, message
+            ),
+        )
 
-    # ── Stage 2: Content extraction (per-page) ───────────────────────
-    text_extractor = TextExtractor()
-    image_extractor = ImageExtractor(doc)
-    table_extractor = TableExtractor()
-    ocr_handler = OCRHandler()
+    if conversion_engine == "custom":
+        # ── Stage 1: Extract metadata ────────────────────────────────────
+        _progress("analyzing", 0, page_count, "Extracting metadata…")
+        meta_extractor = MetadataExtractor()
+        metadata = meta_extractor.extract(doc)
 
-    all_text_blocks: list[dict[str, Any]] = []
-    all_images: list[dict[str, Any]] = []
-    all_tables: list[dict[str, Any]] = []
-    all_links: list[dict[str, Any]] = []
+        # ── Stage 2: Content extraction (per-page) ───────────────────────
+        text_extractor = TextExtractor()
+        image_extractor = ImageExtractor(doc)
+        table_extractor = TableExtractor()
+        ocr_handler = OCRHandler()
 
-    # Create a temporary directory for extracted images.
-    temp_dir = tempfile.mkdtemp(prefix="pdf2docx_imgs_")
+        all_text_blocks: list[dict[str, Any]] = []
+        all_images: list[dict[str, Any]] = []
+        all_tables: list[dict[str, Any]] = []
+        all_links: list[dict[str, Any]] = []
 
-    ocr_enabled = config.get("ocr_enabled", False)
-    ocr_language = config.get("ocr_language", "eng")
+        # Create a temporary directory for extracted images.
+        temp_dir = tempfile.mkdtemp(prefix="pdf2docx_imgs_")
 
-    for page_num in range(page_count):
-        page = doc[page_num]
-        progress.set_description(f"Page {page_num + 1}/{page_count}")
+        ocr_enabled = config.get("ocr_enabled", False)
+        ocr_language = config.get("ocr_language", "eng")
 
-        # ── Text ──
-        _progress("extracting", page_num + 1, page_count,
-                  f"Extracting page {page_num + 1}/{page_count}")
-        text_blocks = text_extractor.extract(page, page_num)
+        for page_num in range(page_count):
+            page = doc[page_num]
+            progress.set_description(f"Page {page_num + 1}/{page_count}")
 
-        # If page has barely any text and OCR is enabled, try OCR.
-        text_len = sum(len(b.get("text", "")) for b in text_blocks)
-        if text_len < 10 and ocr_enabled:
-            if ocr_handler.is_available():
-                logger.info("Page %d: sparse text, running OCR…", page_num + 1)
-                ocr_blocks = ocr_handler.ocr_page(page, language=ocr_language)
-                text_blocks.extend(ocr_blocks)
+            # ── Text ──
+            _progress("extracting", page_num + 1, page_count,
+                      f"Extracting page {page_num + 1}/{page_count}")
+            text_blocks = text_extractor.extract(page, page_num)
+
+            # If page has barely any text and OCR is enabled, try OCR.
+            text_len = sum(len(b.get("text", "")) for b in text_blocks)
+            if text_len < 10 and ocr_enabled:
+                if ocr_handler.is_available():
+                    logger.info("Page %d: sparse text, running OCR…", page_num + 1)
+                    ocr_blocks = ocr_handler.ocr_page(page, language=ocr_language)
+                    text_blocks.extend(ocr_blocks)
+                else:
+                    logger.warning(
+                        "Page %d: needs OCR but Tesseract is not installed.", page_num + 1
+                    )
+
+            # ── Images ──
+            images = image_extractor.extract(page, page_num, temp_dir)
+            all_images.extend(images)
+
+            # ── Tables ──
+            tables = table_extractor.extract(page, page_num)
+
+            # ── Hyperlinks ──
+            links = text_extractor.extract_links(page, page_num)
+            all_links.extend(links)
+
+            # ── Filter out text that falls inside table regions ──
+            text_blocks = _filter_text_in_tables(text_blocks, tables)
+
+            all_text_blocks.extend(text_blocks)
+            all_tables.extend(tables)
+
+            progress.update()
+
+        progress.close()
+        doc.close()
+
+        # ── Normalize extracted data ─────────────────────────────────────
+        all_text_blocks = _normalize_blocks(all_text_blocks)
+        all_images = _normalize_blocks(all_images)
+        all_tables = _normalize_blocks(all_tables)
+
+        logger.info(
+            "Extraction complete — %d text spans, %d images, %d tables, %d links",
+            len(all_text_blocks),
+            len(all_images),
+            len(all_tables),
+            len(all_links),
+        )
+
+        # ── Compute content-based margins ────────────────────────────────
+        _update_metadata_margins(metadata, all_text_blocks, all_images, all_tables)
+
+        # ── Stage 3: Semantic analysis ───────────────────────────────────
+        _progress("analyzing", page_count, page_count, "Semantic analysis…")
+        logger.info("Running semantic analysis…")
+        analyzer = SemanticAnalyzer(config)
+        extracted_data: dict[str, Any] = {
+            "text_blocks": all_text_blocks,
+            "images": all_images,
+            "tables": all_tables,
+            "links": all_links,
+            "metadata": metadata,
+        }
+        structure_map = analyzer.analyze(extracted_data)
+        logger.info("Structure map: %d elements", len(structure_map))
+
+        # ── Stage 4: Build Word document ─────────────────────────────────
+        formatting_overrides: dict[str, Any] = {}
+
+        # Strategy B: AI-guided pre-build analysis
+        if ai_enhance and ai_strategy.upper() == "B":
+            ai_config = config.get("ai_comparison", {})
+            api_key = ai_config.get("api_key") or os.environ.get("GEMINI_API_KEY", "")
+            model = ai_config.get("model", "gemini-2.0-flash")
+
+            if api_key:
+                _progress("ai_layout", page_count, page_count,
+                          "AI layout analysis (Strategy B)…")
+                logger.info("Running AI layout analysis (Strategy B)…")
+                try:
+                    layout_analyzer = AILayoutAnalyzer(
+                        api_key=api_key, model=model,
+                    )
+                    formatting_overrides = layout_analyzer.analyze_layout(
+                        input_path, structure_map,
+                        progress_callback=lambda cur, total, msg: _progress(
+                            "ai_layout", cur, total, msg
+                        ),
+                    )
+                    n_text = len(formatting_overrides.get("text_overrides", {}))
+                    n_table = len(formatting_overrides.get("table_overrides", []))
+                    logger.info(
+                        "AI layout analysis complete — %d text overrides, "
+                        "%d table overrides",
+                        n_text, n_table,
+                    )
+                    _print(f"\n  AI layout: {n_text} text overrides, "
+                           f"{n_table} table overrides")
+                except Exception as exc:
+                    logger.warning("AI layout analysis failed: %s — "
+                                   "proceeding without overrides.", exc)
             else:
-                logger.warning(
-                    "Page %d: needs OCR but Tesseract is not installed.", page_num + 1
-                )
+                logger.warning("Strategy B selected but no API key — "
+                               "building without AI overrides.")
 
-        # ── Images ──
-        images = image_extractor.extract(page, page_num, temp_dir)
-        all_images.extend(images)
+        _progress("building", page_count, page_count, "Building Word document…")
+        logger.info("Building Word document…")
+        builder = DocxBuilder(config)
+        saved_path = builder.build(structure_map, metadata, output_path,
+                                   formatting_overrides=formatting_overrides or None)
+        logger.info("Word document saved → '%s'", saved_path)
 
-        # ── Tables ──
-        tables = table_extractor.extract(page, page_num)
+    # ── Stage 5: Deterministic post-processing + validation ──────────
+    quality_report: dict[str, Any] | None = None
+    composite_score: int | None = None
+    overall_ssim: float | None = None
 
-        # ── Hyperlinks ──
-        links = text_extractor.extract_links(page, page_num)
-        all_links.extend(links)
+    if quality_mode != "off":
+        _progress("postprocess", page_count, page_count,
+                  "Applying deterministic post-processing…")
+        post_stats = _run_docx_postprocess(saved_path, quality_mode)
+        logger.info(
+            "Postprocess stats — blank_removed=%d spacing_clamped=%d "
+            "heading_keep_with_next=%d table_autofit_disabled=%d",
+            post_stats.get("blank_paragraphs_removed", 0),
+            post_stats.get("spacing_clamped", 0),
+            post_stats.get("heading_keep_with_next", 0),
+            post_stats.get("table_autofit_disabled", 0),
+        )
 
-        # ── Filter out text that falls inside table regions ──
-        text_blocks = _filter_text_in_tables(text_blocks, tables)
-
-        all_text_blocks.extend(text_blocks)
-        all_tables.extend(tables)
-
-        progress.update()
-
-    progress.close()
-    doc.close()
-
-    # ── Normalize extracted data ─────────────────────────────────────
-    all_text_blocks = _normalize_blocks(all_text_blocks)
-    all_images = _normalize_blocks(all_images)
-    all_tables = _normalize_blocks(all_tables)
-
-    logger.info(
-        "Extraction complete — %d text spans, %d images, %d tables, %d links",
-        len(all_text_blocks),
-        len(all_images),
-        len(all_tables),
-        len(all_links),
-    )
-
-    # ── Compute content-based margins ────────────────────────────────
-    _update_metadata_margins(metadata, all_text_blocks, all_images, all_tables)
-
-    # ── Stage 3: Semantic analysis ───────────────────────────────────
-    _progress("analyzing", page_count, page_count, "Semantic analysis…")
-    logger.info("Running semantic analysis…")
-    analyzer = SemanticAnalyzer(config)
-    extracted_data: dict[str, Any] = {
-        "text_blocks": all_text_blocks,
-        "images": all_images,
-        "tables": all_tables,
-        "links": all_links,
-        "metadata": metadata,
-    }
-    structure_map = analyzer.analyze(extracted_data)
-    logger.info("Structure map: %d elements", len(structure_map))
-
-    # ── Stage 4: Build Word document ─────────────────────────────────
-    formatting_overrides: dict[str, Any] = {}
-
-    # Strategy B: AI-guided pre-build analysis
-    if ai_compare and ai_strategy.upper() == "B":
-        ai_config = config.get("ai_comparison", {})
-        api_key = ai_config.get("api_key") or os.environ.get("GEMINI_API_KEY", "")
-        model = ai_config.get("model", "gemini-2.0-flash")
-
-        if api_key:
-            _progress("ai_layout", page_count, page_count,
-                      "AI layout analysis (Strategy B)…")
-            logger.info("Running AI layout analysis (Strategy B)…")
-            try:
-                layout_analyzer = AILayoutAnalyzer(
-                    api_key=api_key, model=model,
-                )
-                formatting_overrides = layout_analyzer.analyze_layout(
-                    input_path, structure_map,
-                    progress_callback=lambda cur, total, msg: _progress(
-                        "ai_layout", cur, total, msg
-                    ),
-                )
-                n_text = len(formatting_overrides.get("text_overrides", {}))
-                n_table = len(formatting_overrides.get("table_overrides", []))
-                logger.info(
-                    "AI layout analysis complete — %d text overrides, "
-                    "%d table overrides",
-                    n_text, n_table,
-                )
-                _print(f"\n  AI layout: {n_text} text overrides, "
-                       f"{n_table} table overrides")
-            except Exception as exc:
-                logger.warning("AI layout analysis failed: %s — "
-                               "proceeding without overrides.", exc)
-        else:
-            logger.warning("Strategy B selected but no API key — "
-                           "building without AI overrides.")
-
-    _progress("building", page_count, page_count, "Building Word document…")
-    logger.info("Building Word document…")
-    builder = DocxBuilder(config)
-    saved_path = builder.build(structure_map, metadata, output_path,
-                               formatting_overrides=formatting_overrides or None)
-    logger.info("Word document saved → '%s'", saved_path)
-
-    # ── Stage 5: Validation (optional) ───────────────────────────────
-    _progress("validating", page_count, page_count, "Validating output…")
-    if validate:
+    if validate or quality_mode != "off":
+        _progress("validating", page_count, page_count, "Validating output…")
         logger.info("Validating output…")
         validator = OutputValidator()
-        report = validator.quality_score(saved_path, info)
-        score = report.get("quality_score", "?")
-        level = report.get("quality_level", "?")
-        _print(f"\n  Quality: {level} ({score}/100)")
-        metrics = report.get("metrics", {})
+        quality_report = validator.quality_score(saved_path, info)
+        score = quality_report.get("quality_score", "?")
+        level = quality_report.get("quality_level", "?")
+        if validate or quality_mode != "off":
+            _print(f"\n  Quality: {level} ({score}/100)")
+        metrics = quality_report.get("metrics", {})
         if metrics:
             logger.info(
                 "Metrics: %d paragraphs, %d tables, %d images, %d headings",
@@ -470,15 +699,15 @@ def convert_pdf(
                 metrics.get("images", 0),
                 metrics.get("headings", 0),
             )
-        if not report["valid"]:
+        if not quality_report["valid"]:
             logger.warning("Validation issues:")
-            for issue in report.get("issues", []):
+            for issue in quality_report.get("issues", []):
                 logger.warning("  • %s", issue)
-        for warning in report.get("warnings", []):
+        for warning in quality_report.get("warnings", []):
             logger.warning("  ⚠ %s", warning)
 
     # ── Stage 6-9: Visual diff + AI comparison (optional) ─────────────
-    if visual_validate or ai_compare:
+    if visual_validate or ai_enhance:
         _progress("visual_diff", page_count, page_count, "Running visual diff…")
         vd_config = config.get("visual_diff", {})
         dpi = vd_config.get("dpi", 150)
@@ -506,7 +735,7 @@ def convert_pdf(
 
         # AI comparison + correction loop (Strategy A only).
         # Strategy B already applied overrides pre-build; just report SSIM.
-        if ai_compare and overall_ssim < 0.95 and ai_strategy.upper() == "A":
+        if ai_enhance and overall_ssim < 0.95 and ai_strategy.upper() == "A":
             ai_config = config.get("ai_comparison", {})
             api_key = ai_config.get("api_key") or os.environ.get("GEMINI_API_KEY", "")
             model = ai_config.get("model", "gemini-2.0-flash")
@@ -569,12 +798,100 @@ def convert_pdf(
             else:
                 _print("  [SKIP] No GEMINI_API_KEY set — skipping AI comparison.")
 
+    # ── Stage 10: Quality gate + optional deterministic fallback ─────
+    if quality_report is not None:
+        composite_score = _composite_quality_score(
+            int(quality_report.get("quality_score", 0)),
+            overall_ssim,
+            quality_use_visual,
+        )
+        logger.info("Composite quality score: %d/100", composite_score)
+
+        gate_failed = composite_score < quality_min_score
+        if quality_use_visual and overall_ssim is not None:
+            gate_failed = gate_failed or (overall_ssim < quality_min_visual_ssim)
+
+        if gate_failed and quality_engine_fallback:
+            alt_engine = "pdf2docx_lib" if conversion_engine == "custom" else "custom"
+            logger.warning(
+                "Quality gate failed (%d < %d). Trying fallback engine '%s'.",
+                composite_score,
+                quality_min_score,
+                alt_engine,
+            )
+            fallback_config = copy.deepcopy(config)
+            fallback_quality = fallback_config.setdefault("quality", {})
+            fallback_quality["engine_fallback"] = False
+            fallback_quality["gate"] = "off"
+
+            fd, fallback_path = tempfile.mkstemp(prefix="pdf2docx_fallback_",
+                                                 suffix=".docx")
+            os.close(fd)
+            try:
+                convert_pdf(
+                    input_path,
+                    fallback_path,
+                    fallback_config,
+                    password=password,
+                    validate=False,
+                    visual_validate=False,
+                    ai_enhance=False,
+                    conversion_engine=alt_engine,
+                    progress_callback=None,
+                )
+                validator = OutputValidator()
+                fallback_report = validator.quality_score(fallback_path, info)
+                fallback_score = int(fallback_report.get("quality_score", 0))
+                if fallback_score > composite_score:
+                    logger.info(
+                        "Fallback engine '%s' improved quality from %d to %d.",
+                        alt_engine,
+                        composite_score,
+                        fallback_score,
+                    )
+                    shutil.move(fallback_path, saved_path)
+                    quality_report = fallback_report
+                    composite_score = fallback_score
+                    gate_failed = composite_score < quality_min_score
+                else:
+                    logger.info(
+                        "Fallback engine '%s' did not improve quality (%d <= %d).",
+                        alt_engine,
+                        fallback_score,
+                        composite_score,
+                    )
+            except Exception as exc:
+                logger.warning("Fallback conversion failed: %s", exc)
+            finally:
+                try:
+                    if os.path.exists(fallback_path):
+                        os.remove(fallback_path)
+                except OSError:
+                    pass
+
+        if gate_failed and quality_gate == "warn":
+            logger.warning(
+                "Quality gate warning: composite=%d (min=%d)%s",
+                composite_score,
+                quality_min_score,
+                (
+                    f", visual={overall_ssim:.1%} (min={quality_min_visual_ssim:.1%})"
+                    if (quality_use_visual and overall_ssim is not None)
+                    else ""
+                ),
+            )
+        elif gate_failed and quality_gate == "fail":
+            raise RuntimeError(
+                f"Quality gate failed: composite={composite_score} < "
+                f"min_score={quality_min_score}"
+            )
+
     # ── Clean up temp images ─────────────────────────────────────────
-    try:
-        import shutil
-        shutil.rmtree(temp_dir, ignore_errors=True)
-    except Exception:
-        pass
+    if temp_dir:
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     _progress("complete", page_count, page_count, "Conversion complete")
     _print(f"\n[OK] Conversion complete: {saved_path}")
@@ -608,7 +925,14 @@ def convert_batch(
         out_path = os.path.join(output_dir, f"{base}.docx")
         print(f"\n[{i}/{total}] {os.path.basename(pdf_path)}")
         try:
-            convert_pdf(pdf_path, out_path, config, password, validate)
+            convert_pdf(
+                pdf_path,
+                out_path,
+                config,
+                password=password,
+                validate=validate,
+                conversion_engine=config.get("conversion_engine", "custom"),
+            )
         except SystemExit:
             logger.warning("Skipping '%s' due to error.", pdf_path)
         except Exception:
@@ -688,16 +1012,53 @@ def main() -> None:
         help="Render PDF and DOCX, then compute SSIM visual similarity scores.",
     )
     parser.add_argument(
-        "--ai-compare",
+        "--use-pdf2docx-lib",
         action="store_true",
-        help="Use AI (Gemini) to detect and fix visual differences (requires GEMINI_API_KEY).",
+        help="Use external pdf2docx library engine instead of custom pipeline.",
+    )
+    parser.add_argument(
+        "--quality-mode",
+        type=str,
+        choices=["off", "basic", "strict"],
+        default=None,
+        help="Deterministic quality mode: off, basic, or strict.",
+    )
+    parser.add_argument(
+        "--quality-gate",
+        type=str,
+        choices=["off", "warn", "fail"],
+        default=None,
+        help="Quality gate behavior when score is below threshold.",
+    )
+    parser.add_argument(
+        "--min-quality-score",
+        type=int,
+        default=None,
+        help="Minimum composite quality score (0-100) for quality gate.",
+    )
+    parser.add_argument(
+        "--quality-use-visual",
+        action="store_true",
+        help="Include visual SSIM in composite quality score.",
+    )
+    parser.add_argument(
+        "--quality-engine-fallback",
+        action="store_true",
+        help="Retry with alternate engine when quality gate fails.",
+    )
+    parser.add_argument(
+        "--ai-enhance", "--ai-compare",
+        dest="ai_enhance",
+        action="store_true",
+        help="Enable AI-powered enhancement using Gemini (requires GEMINI_API_KEY). "
+             "(`--ai-compare` is kept as a compatibility alias)",
     )
     parser.add_argument(
         "--ai-strategy",
         type=str,
         choices=["A", "B"],
-        default="A",
-        help="AI strategy: A = post-build correction loop, B = pre-build AI-guided layout (default: A).",
+        default="B",
+        help="AI strategy: A = post-build correction loop, B = pre-build AI-guided layout (default: B).",
     )
 
     args = parser.parse_args()
@@ -719,6 +1080,19 @@ def main() -> None:
         config["skip_watermarks"] = True
     if args.verbose:
         config["verbose"] = True
+    if args.use_pdf2docx_lib:
+        config["conversion_engine"] = "pdf2docx_lib"
+    quality_config = config.setdefault("quality", {})
+    if args.quality_mode is not None:
+        quality_config["mode"] = args.quality_mode
+    if args.quality_gate is not None:
+        quality_config["gate"] = args.quality_gate
+    if args.min_quality_score is not None:
+        quality_config["min_score"] = max(0, min(100, args.min_quality_score))
+    if args.quality_use_visual:
+        quality_config["use_visual"] = True
+    if args.quality_engine_fallback:
+        quality_config["engine_fallback"] = True
 
     # ── Batch mode ───────────────────────────────────────────────────
     if args.batch:
@@ -744,9 +1118,17 @@ def main() -> None:
             print("Aborted.")
             sys.exit(0)
 
-    convert_pdf(input_path, output_path, config, args.password, args.validate,
-                args.visual_validate, args.ai_compare,
-                ai_strategy=args.ai_strategy)
+    convert_pdf(
+        input_path,
+        output_path,
+        config,
+        password=args.password,
+        validate=args.validate,
+        visual_validate=args.visual_validate,
+        ai_enhance=args.ai_enhance,
+        ai_strategy=args.ai_strategy,
+        conversion_engine=config.get("conversion_engine", "custom"),
+    )
 
 
 if __name__ == "__main__":

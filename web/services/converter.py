@@ -57,6 +57,21 @@ class ConversionJob:
         self.completed_at: str | None = None
 
     # ── Serialisation ────────────────────────────────────────────────
+    def _settings_summary(self) -> dict[str, Any]:
+        """Return a safe, UI-friendly summary of job settings."""
+        engine = "pdf2docx_lib" if self.settings.get("use_pdf2docx_lib") else "custom"
+        ai_enabled = bool(self.settings.get("ai_enabled", self.settings.get("ai_compare", False)))
+        ai_strategy = self.settings.get("ai_strategy", "B")
+        quality_mode = self.settings.get("quality_mode", "basic")
+        quality_gate = self.settings.get("quality_gate", "warn")
+        return {
+            "engine": engine,
+            "ai_enabled": ai_enabled,
+            "ai_strategy": ai_strategy,
+            "quality_mode": quality_mode,
+            "quality_gate": quality_gate,
+        }
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -69,6 +84,7 @@ class ConversionJob:
             "message": self.message,
             "error": self.error,
             "quality_report": self.quality_report,
+            "settings_summary": self._settings_summary(),
             "created_at": self.created_at,
             "completed_at": self.completed_at,
         }
@@ -165,15 +181,30 @@ class ConverterService:
         if settings.get("skip_watermarks"):
             config["skip_watermarks"] = True
 
+        quality_cfg = config.setdefault("quality", {})
+        if "quality_mode" in settings:
+            quality_cfg["mode"] = settings.get("quality_mode")
+        if "quality_gate" in settings:
+            quality_cfg["gate"] = settings.get("quality_gate")
+        if "min_quality_score" in settings:
+            quality_cfg["min_score"] = settings.get("min_quality_score")
+        if "quality_use_visual" in settings:
+            quality_cfg["use_visual"] = bool(settings.get("quality_use_visual"))
+        if "quality_engine_fallback" in settings:
+            quality_cfg["engine_fallback"] = bool(settings.get("quality_engine_fallback"))
+
         password = settings.get("password")
+        conversion_engine = (
+            "pdf2docx_lib" if settings.get("use_pdf2docx_lib") else "custom"
+        )
         
-        # AI comparison settings
-        ai_compare = settings.get("ai_compare", False)
+        # Master AI enhancement settings
+        ai_enabled = settings.get("ai_enabled", settings.get("ai_compare", False))
         gemini_api_key = settings.get("gemini_api_key")
-        ai_strategy = settings.get("ai_strategy", "A")
+        ai_strategy = settings.get("ai_strategy", "B")
         
         # Store API key in config if provided (for this conversion only)
-        if ai_compare and gemini_api_key:
+        if ai_enabled and gemini_api_key:
             if "ai_comparison" not in config:
                 config["ai_comparison"] = {}
             config["ai_comparison"]["api_key"] = gemini_api_key
@@ -218,9 +249,10 @@ class ConverterService:
                 config,
                 password=password,
                 validate=False,
-                visual_validate=ai_compare,  # Visual diff needed for AI compare
-                ai_compare=ai_compare,
+                visual_validate=ai_enabled,  # Visual diff needed for AI enhancement
+                ai_enhance=ai_enabled,
                 ai_strategy=ai_strategy,
+                conversion_engine=conversion_engine,
                 progress_callback=_progress_callback,
             )
 

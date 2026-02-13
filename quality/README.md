@@ -223,7 +223,7 @@ python pdf2docx.py input.pdf --visual-validate
 
 # With AI comparison and auto-correction (requires API key)
 export GEMINI_API_KEY="your_key"
-python pdf2docx.py input.pdf --visual-validate --ai-compare
+python pdf2docx.py input.pdf --visual-validate --ai-enhance
 
 # Output includes:
 # - output.docx (converted document)
@@ -256,7 +256,7 @@ Pillow>=10.0.0          # Image processing
 # Visual diff (required for --visual-validate)
 scikit-image>=0.24.0    # SSIM computation
 
-# AI comparison (optional, required for --ai-compare)
+# AI comparison (optional, required for --ai-enhance)
 google-generativeai>=0.8.0  # Gemini API
 ```
 

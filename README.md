@@ -52,7 +52,7 @@
 | **Python 3.12+** | Runtime | ✅ Yes |
 | **LibreOffice** | DOCX → PDF rendering for visual diff | ⚠️ For `--visual-validate` |
 | **Tesseract OCR** | Scanned PDF text recognition | ⚠️ For `--ocr` |
-| **Gemini API Key** | AI-powered comparison & correction | ⚠️ For `--ai-compare` |
+| **Gemini API Key** | AI-powered enhancement | ⚠️ For `--ai-enhance` |
 
 ### Installation
 
@@ -310,7 +310,10 @@ python -m web.app
 
 - **Drag-and-Drop Upload** — Drop a PDF (up to 50 MB) onto the page
 - **Real-Time Progress** — Server-Sent Events (SSE) stream conversion status live
-- **AI Strategy Selector** — Choose between Strategy A and Strategy B from the UI
+- **AI Enhancement Toggle** — Turn all AI enhancement steps on/off from the UI
+- **AI Strategy Selector** — Choose Strategy A or B when AI enhancement is enabled
+- **Library Engine Switch** — Enable/disable external `pdf2docx` library conversion
+- **Style Chat Editor** — Prompt-driven design/layout restyling while preserving document content
 - **Side-by-Side Preview** — Compare original PDF pages with converted DOCX pages
 - **Visual Diff Report** — SSIM scores and difference heatmaps per page
 - **Conversion History** — Browse and re-download previous conversions
@@ -324,7 +327,8 @@ python -m web.app
 usage: pdf2docx [-h] [--ocr] [--password PASSWORD] [--config CONFIG]
                 [--verbose] [--validate] [--batch BATCH]
                 [--output-dir OUTPUT_DIR] [--skip-watermarks] [--force]
-                [--visual-validate] [--ai-compare] [--ai-strategy {A,B}]
+                [--visual-validate] [--use-pdf2docx-lib]
+                [--ai-enhance] [--ai-strategy {A,B}]
                 [input] [output]
 ```
 
@@ -349,8 +353,9 @@ usage: pdf2docx [-h] [--ocr] [--password PASSWORD] [--config CONFIG]
 | `--skip-watermarks` | Attempt to skip watermark / background images |
 | `--force` | Overwrite existing output files without prompting |
 | `--visual-validate` | Render PDF and DOCX, then compute SSIM visual similarity scores |
-| `--ai-compare` | Use Gemini AI to detect and fix visual differences (requires `GEMINI_API_KEY`) |
-| `--ai-strategy {A,B}` | AI strategy: `A` = post-build correction loop, `B` = pre-build AI-guided layout (default: `A`) |
+| `--use-pdf2docx-lib` | Use external `pdf2docx` library engine instead of custom pipeline |
+| `--ai-enhance` | Enable AI-powered enhancement using Gemini (requires `GEMINI_API_KEY`; `--ai-compare` is kept as an alias) |
+| `--ai-strategy {A,B}` | AI strategy: `A` = post-build correction loop, `B` = pre-build AI-guided layout (default: `B`) |
 
 ### Examples
 
@@ -365,10 +370,13 @@ python pdf2docx.py document.pdf output.docx
 python pdf2docx.py scanned.pdf --ocr
 
 # Full quality pipeline with AI Strategy B (recommended)
-python pdf2docx.py report.pdf --visual-validate --ai-compare --ai-strategy B
+python pdf2docx.py report.pdf --visual-validate --ai-enhance --ai-strategy B
+
+# Convert using the external pdf2docx library engine
+python pdf2docx.py report.pdf --use-pdf2docx-lib
 
 # Post-build AI correction loop (Strategy A)
-python pdf2docx.py report.pdf --visual-validate --ai-compare --ai-strategy A
+python pdf2docx.py report.pdf --visual-validate --ai-enhance --ai-strategy A
 
 # Batch convert all PDFs in a directory
 python pdf2docx.py --batch ./pdfs/ --output-dir ./output/
@@ -428,6 +436,7 @@ AI settings can be provided via environment variables or in `config/settings.jso
 |---|---|---|---|
 | `api_key` | `GEMINI_API_KEY` | — | Google Gemini API key |
 | `model` | — | `gemini-2.0-flash` | Gemini model to use |
+| `enabled` | — | `false` | Master switch for AI enhancement |
 | `strategy` | — | `B` | Default AI strategy (`A` or `B`) |
 | `max_rounds` | — | `3` | Maximum correction rounds (Strategy A only) |
 | `max_tokens_per_conversion` | — | `50000` | Token budget per conversion |
@@ -564,7 +573,7 @@ C:\Program Files\LibreOffice\program\
 <details>
 <summary><b>GEMINI_API_KEY not set</b></summary>
 
-**Symptom:** `--ai-compare` fails with an API key error.
+**Symptom:** `--ai-enhance` fails with an API key error.
 
 **Fix:** Set the environment variable or add it to `config/settings.json`:
 ```json
@@ -583,7 +592,7 @@ Get a key from [Google AI Studio](https://aistudio.google.com/apikey).
 **Symptom:** Visual validation reports scores below 0.70.
 
 **Possible causes:**
-- Complex multi-column layouts → Try `--ai-compare --ai-strategy B`
+- Complex multi-column layouts → Try `--ai-enhance --ai-strategy B`
 - Missing system fonts → Install fonts that match the PDF, or adjust `fallback_font` in config
 - Scanned PDF without OCR → Add `--ocr` flag
 - Tables with complex borders → Known limitation; improvements planned

@@ -31,7 +31,7 @@
         <h2>Upload</h2>
 
         <!-- Drop Zone -->
-        <div id="dropZone" class="drop-zone">
+        <div id="dropZone" class="drop-zone" role="button" tabindex="0" aria-label="Upload PDF files">
           <svg class="drop-icon" viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
             <polyline points="17 8 12 3 7 8"/>
@@ -41,6 +41,9 @@
           <span class="drop-hint">or click to browse (max 50 MB)</span>
           <input type="file" id="fileInput" accept=".pdf" multiple hidden>
         </div>
+
+        <!-- Inline Feedback -->
+        <div id="feedbackArea" class="feedback" hidden role="status" aria-live="polite"></div>
 
         <!-- File List -->
         <div id="fileList" class="file-list" hidden></div>
@@ -58,19 +61,44 @@
               <input type="checkbox" id="settingWatermarks">
             </label>
             <label class="setting-row">
+              <span>Use pdf2docx Library Engine</span>
+              <input type="checkbox" id="settingUsePdf2docxLib">
+            </label>
+            <label class="setting-row">
               <span>PDF password</span>
               <input type="text" id="settingPassword" placeholder="(leave blank if none)" class="text-input">
             </label>
+            <div class="setting-row">
+              <span>Quality Mode</span>
+              <select id="settingQualityMode" class="text-input" style="width: auto; min-width: 160px;">
+                <option value="off">Off</option>
+                <option value="basic" selected>Basic</option>
+                <option value="strict">Strict</option>
+              </select>
+            </div>
+            <div class="setting-row">
+              <span>Quality Gate</span>
+              <select id="settingQualityGate" class="text-input" style="width: auto; min-width: 160px;">
+                <option value="off">Off</option>
+                <option value="warn" selected>Warn</option>
+                <option value="fail">Fail</option>
+              </select>
+            </div>
+            <label class="setting-row">
+              <span>Fallback to Alternate Engine</span>
+              <input type="checkbox" id="settingQualityFallback">
+            </label>
             <hr style="margin: 0.75rem 0; border: none; border-top: 1px solid #e0e0e0;">
             <label class="setting-row">
-              <span>Enable AI Comparison & Auto-correction</span>
-              <input type="checkbox" id="settingAiCompare">
+              <span>Enable AI Enhancement</span>
+              <input type="checkbox" id="settingAiEnhance">
             </label>
             <div id="aiKeySection" style="display: none;">
               <label class="setting-row">
                 <span>Gemini API Key</span>
                 <input type="password" id="settingGeminiKey" placeholder="Enter your Gemini API key" class="text-input">
               </label>
+              <small id="aiKeyHint" class="setting-helper" hidden>Gemini API Key is required when AI Enhancement is enabled.</small>
               <div class="setting-row" style="margin-top: 0.5rem;">
                 <span>AI Strategy</span>
                 <select id="settingAiStrategy" class="text-input" style="width: auto; min-width: 180px;">
@@ -94,6 +122,7 @@
         <button id="convertBtn" class="btn btn-primary" disabled>
           Convert
         </button>
+        <p id="convertHint" class="muted convert-hint">Add at least one PDF file to start conversion.</p>
       </section>
 
       <!-- Right Panel: Results / Preview -->
@@ -111,7 +140,7 @@
         </div>
 
         <!-- Active Jobs -->
-        <div id="activeJobs" hidden></div>
+        <div id="activeJobs" hidden aria-live="polite"></div>
 
         <!-- Preview Area -->
         <div id="previewArea" hidden>
@@ -134,6 +163,21 @@
             </div>
           </div>
         </div>
+
+        <!-- Style Chat Editor -->
+        <div id="styleEditor" class="style-editor" hidden>
+          <div class="preview-header">
+            <h3>Style Chat Editor</h3>
+            <span id="styleEditorJob" class="muted">No target selected</span>
+          </div>
+          <p class="muted">Ask for design/layout changes while preserving content.</p>
+          <textarea id="stylePrompt" class="text-input style-prompt" placeholder="Example: Make headings dark blue, use a clean modern style, tighter paragraph spacing, and improve table header styling."></textarea>
+          <div class="style-controls">
+            <input type="password" id="styleGeminiKey" class="text-input" placeholder="Gemini API key (optional)">
+            <input type="text" id="styleModel" class="text-input" value="gemini-2.0-flash" placeholder="Model">
+            <button id="applyStyleBtn" class="btn btn-small">Apply Style</button>
+          </div>
+        </div>
       </section>
     </main>
 
@@ -149,6 +193,9 @@
     </section>
   </div>
 
+  <!-- docx-preview: visual DOCX rendering in the browser -->
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3/dist/jszip.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/docx-preview@0.3.7/dist/docx-preview.min.js"></script>
   <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>

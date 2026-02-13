@@ -10,6 +10,8 @@ const dropZone       = document.getElementById("dropZone");
 const fileInput      = document.getElementById("fileInput");
 const fileList       = document.getElementById("fileList");
 const convertBtn     = document.getElementById("convertBtn");
+const convertHint    = document.getElementById("convertHint");
+const feedbackArea   = document.getElementById("feedbackArea");
 const emptyState     = document.getElementById("emptyState");
 const activeJobs     = document.getElementById("activeJobs");
 const previewArea    = document.getElementById("previewArea");
@@ -20,6 +22,16 @@ const nextPageBtn    = document.getElementById("nextPage");
 const pageIndicator  = document.getElementById("pageIndicator");
 const historyBody    = document.getElementById("historyBody");
 const refreshHistory = document.getElementById("refreshHistory");
+const styleEditor = document.getElementById("styleEditor");
+const styleEditorJob = document.getElementById("styleEditorJob");
+const stylePrompt = document.getElementById("stylePrompt");
+const styleGeminiKey = document.getElementById("styleGeminiKey");
+const styleModel = document.getElementById("styleModel");
+const applyStyleBtn = document.getElementById("applyStyleBtn");
+const settingAiEnhance = document.getElementById("settingAiEnhance");
+const settingGeminiKey = document.getElementById("settingGeminiKey");
+const aiKeySection = document.getElementById("aiKeySection");
+const aiKeyHint = document.getElementById("aiKeyHint");
 
 // ── State ───────────────────────────────────────────────────────────
 let pendingFiles = [];          // Files selected but not yet uploaded
@@ -27,9 +39,17 @@ let activeJobMap = new Map();   // jobId -> {sse, data}
 let previewJob   = null;        // jobId currently being previewed
 let previewPage  = 0;
 let previewTotal = 1;
+let feedbackTimer = null;
+let styleTargetJobId = null;
 
 // ── Drag & Drop ─────────────────────────────────────────────────────
 dropZone.addEventListener("click", () => fileInput.click());
+dropZone.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    fileInput.click();
+  }
+});
 
 dropZone.addEventListener("dragover", (e) => {
   e.preventDefault();
@@ -52,14 +72,28 @@ fileInput.addEventListener("change", () => {
 
 // ── File Management ─────────────────────────────────────────────────
 function addFiles(files) {
+  let rejectedLarge = 0;
+  let skippedDup = 0;
+  let added = 0;
   for (const f of files) {
     if (f.size > 50 * 1024 * 1024) {
-      alert(`"${f.name}" exceeds the 50 MB limit.`);
+      rejectedLarge += 1;
       continue;
     }
     // Avoid duplicates.
-    if (pendingFiles.some(p => p.name === f.name && p.size === f.size)) continue;
+    if (pendingFiles.some(p => p.name === f.name && p.size === f.size)) {
+      skippedDup += 1;
+      continue;
+    }
     pendingFiles.push(f);
+    added += 1;
+  }
+  if (rejectedLarge > 0) {
+    showFeedback(`${rejectedLarge} file(s) were skipped (over 50 MB).`, "warn");
+  } else if (skippedDup > 0 && added === 0) {
+    showFeedback("All selected files were already in the list.", "info");
+  } else if (added > 0) {
+    showFeedback(`${added} file(s) added for conversion.`, "success", 2500);
   }
   renderFileList();
 }
@@ -72,44 +106,64 @@ function removeFile(index) {
 function renderFileList() {
   if (pendingFiles.length === 0) {
     fileList.hidden = true;
-    convertBtn.disabled = true;
+    updateConvertState();
     return;
   }
   fileList.hidden = false;
-  convertBtn.disabled = false;
   fileList.innerHTML = pendingFiles.map((f, i) => `
     <div class="file-item">
       <span class="name" title="${esc(f.name)}">${esc(f.name)}</span>
       <span class="size">${formatSize(f.size)}</span>
-      <button class="remove" onclick="removeFile(${i})" title="Remove">&times;</button>
+      <button class="remove" data-remove-index="${i}" title="Remove">&times;</button>
     </div>
   `).join("");
+  updateConvertState();
 }
+
+fileList.addEventListener("click", (event) => {
+  const btn = event.target.closest("button[data-remove-index]");
+  if (!btn) return;
+  const idx = Number(btn.getAttribute("data-remove-index"));
+  if (!Number.isNaN(idx)) {
+    removeFile(idx);
+  }
+});
 
 // ── Convert ─────────────────────────────────────────────────────────
 convertBtn.addEventListener("click", startConversion);
 
 async function startConversion() {
-  if (pendingFiles.length === 0) return;
+  if (pendingFiles.length === 0) {
+    updateConvertState();
+    return;
+  }
   
-  const aiCompareEnabled = document.getElementById("settingAiCompare").checked;
-  const geminiKey = document.getElementById("settingGeminiKey").value.trim();
+  const aiEnhanceEnabled = settingAiEnhance.checked;
+  const geminiKey = settingGeminiKey.value.trim();
   
-  // Validate API key if AI compare is enabled
-  if (aiCompareEnabled && !geminiKey) {
-    alert("Please enter your Gemini API key to use AI Comparison & Auto-correction.\n\nGet your key at: https://aistudio.google.com/app/apikey");
+  // Validate API key if AI enhancement is enabled
+  if (aiEnhanceEnabled && !geminiKey) {
+    updateConvertState();
+    showFeedback("Gemini API Key is required when AI Enhancement is enabled.", "error", 6000);
     return;
   }
   
   convertBtn.disabled = true;
+  convertHint.textContent = "Uploading and starting conversion…";
+  showFeedback("Starting conversion job(s)…", "info", 3000);
 
   const settings = {
     ocr: document.getElementById("settingOcr").checked,
     skip_watermarks: document.getElementById("settingWatermarks").checked,
+    use_pdf2docx_lib: document.getElementById("settingUsePdf2docxLib").checked,
     password: document.getElementById("settingPassword").value || undefined,
-    ai_compare: aiCompareEnabled,
-    gemini_api_key: aiCompareEnabled ? geminiKey : undefined,
-    ai_strategy: aiCompareEnabled ? document.getElementById("settingAiStrategy").value : undefined,
+    quality_mode: document.getElementById("settingQualityMode").value,
+    quality_gate: document.getElementById("settingQualityGate").value,
+    quality_engine_fallback: document.getElementById("settingQualityFallback").checked,
+    ai_enabled: aiEnhanceEnabled,
+    ai_compare: aiEnhanceEnabled, // compatibility with older backend code
+    gemini_api_key: aiEnhanceEnabled ? geminiKey : undefined,
+    ai_strategy: aiEnhanceEnabled ? document.getElementById("settingAiStrategy").value : undefined,
   };
 
   // Hide empty state.
@@ -124,14 +178,20 @@ async function startConversion() {
     try {
       const resp = await fetch("/api/upload", { method: "POST", body: formData });
       if (!resp.ok) {
-        const err = await resp.json();
-        alert(`Upload failed for "${file.name}": ${err.error || resp.statusText}`);
+        let errText = resp.statusText;
+        try {
+          const err = await resp.json();
+          errText = err.error || errText;
+        } catch {
+          // keep fallback status text
+        }
+        showFeedback(`Upload failed for "${file.name}": ${errText}`, "error", 7000);
         continue;
       }
       const { job_id, filename } = await resp.json();
-      trackJob(job_id, filename);
+      trackJob(job_id, filename, settings);
     } catch (err) {
-      alert(`Network error uploading "${file.name}": ${err.message}`);
+      showFeedback(`Network error uploading "${file.name}": ${err.message}`, "error", 7000);
     }
   }
 
@@ -140,9 +200,9 @@ async function startConversion() {
 }
 
 // ── Job Tracking (SSE) ──────────────────────────────────────────────
-function trackJob(jobId, filename) {
+function trackJob(jobId, filename, settings) {
   const sse = new EventSource(`/api/status/${jobId}/stream`);
-  activeJobMap.set(jobId, { sse, data: null });
+  activeJobMap.set(jobId, { sse, data: null, settings });
 
   sse.onmessage = (event) => {
     const data = JSON.parse(event.data);
@@ -181,15 +241,32 @@ async function pollJob(jobId) {
 // ── Render Active Jobs ──────────────────────────────────────────────
 function renderJobs() {
   const cards = [];
-  for (const [jobId, { data }] of activeJobMap) {
+  for (const [jobId, { data, settings }] of activeJobMap) {
     if (!data) continue;
     const statusCls = `status-${data.status}`;
     const progressCls = data.status === "complete" ? "complete" : "";
+    const meta = data.settings_summary || {
+      engine: settings?.use_pdf2docx_lib ? "pdf2docx_lib" : "custom",
+      ai_enabled: !!settings?.ai_enabled,
+      ai_strategy: settings?.ai_strategy || "B",
+      quality_mode: settings?.quality_mode || "basic",
+      quality_gate: settings?.quality_gate || "warn",
+    };
+
+    const metaHtml = `
+      <div class="job-meta">
+        <span class="meta-chip">Engine: ${meta.engine === "pdf2docx_lib" ? "pdf2docx library" : "custom"}</span>
+        <span class="meta-chip">AI: ${meta.ai_enabled ? "on" : "off"}</span>
+        <span class="meta-chip">Quality: ${meta.quality_mode || "basic"}/${meta.quality_gate || "warn"}</span>
+        <span class="meta-chip">Strategy: ${meta.ai_strategy || "B"}</span>
+      </div>
+    `;
 
     let actionsHtml = "";
     if (data.status === "complete") {
       actionsHtml += `<button class="btn btn-success btn-small" onclick="downloadJob('${jobId}')">&#11015; Download .docx</button>`;
       actionsHtml += `<button class="btn btn-small" onclick="showPreview('${jobId}', ${data.page_count})">&#128196; Preview PDF</button>`;
+      actionsHtml += `<button class="btn btn-small" onclick="openStyleEditor('${jobId}')">🎨 Style</button>`;
     }
     if (data.status === "complete" || data.status === "failed") {
       actionsHtml += `<button class="btn btn-small" onclick="removeJob('${jobId}')">&times; Remove</button>`;
@@ -227,6 +304,7 @@ function renderJobs() {
         <div class="progress-bar-track">
           <div class="progress-bar-fill ${progressCls}" style="width:${data.progress}%"></div>
         </div>
+        ${metaHtml}
         <div class="job-message">${esc(data.message || "")}</div>
         ${errorHtml}
         ${qualityHtml}
@@ -264,6 +342,66 @@ function showPreview(jobId, pageCount) {
   loadDocxPreview(jobId);
 }
 
+function openStyleEditor(jobId) {
+  styleTargetJobId = jobId;
+  styleEditor.hidden = false;
+  styleEditorJob.textContent = `Target job: ${jobId}`;
+  if (!stylePrompt.value.trim()) {
+    stylePrompt.value = "Make the document look modern and professional with improved heading hierarchy and clean table headers.";
+  }
+  stylePrompt.focus();
+}
+
+async function applyStylePrompt() {
+  if (!styleTargetJobId) {
+    showFeedback("Select a completed job first using the Style button.", "warn", 5000);
+    return;
+  }
+  const prompt = stylePrompt.value.trim();
+  if (!prompt) {
+    showFeedback("Enter a style prompt first.", "warn", 4000);
+    return;
+  }
+
+  applyStyleBtn.disabled = true;
+  showFeedback("Applying style changes…", "info", 3000);
+  try {
+    const resp = await fetch(`/api/style/${styleTargetJobId}/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt,
+        gemini_api_key: styleGeminiKey.value.trim() || undefined,
+        model: styleModel.value.trim() || undefined,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showFeedback(data.error || "Style update failed.", "error", 7000);
+      return;
+    }
+
+    showFeedback(data.summary || "Style updated.", "success", 5000);
+
+    if (activeJobMap.has(styleTargetJobId)) {
+      const entry = activeJobMap.get(styleTargetJobId);
+      if (entry?.data) {
+        entry.data.quality_report = data.quality_report || entry.data.quality_report;
+        entry.data.message = "Style updated";
+      }
+      renderJobs();
+    }
+    if (previewJob === styleTargetJobId) {
+      await loadDocxPreview(styleTargetJobId);
+    }
+    loadHistory();
+  } catch (err) {
+    showFeedback(`Style request failed: ${err.message}`, "error", 7000);
+  } finally {
+    applyStyleBtn.disabled = false;
+  }
+}
+
 function renderPreview() {
   pageIndicator.textContent = `Page ${previewPage + 1} / ${previewTotal}`;
   prevPageBtn.disabled = previewPage <= 0;
@@ -275,40 +413,49 @@ async function loadDocxPreview(jobId) {
   const docxDiv = document.getElementById("docxPreview");
   docxDiv.innerHTML = `<p class="muted">Loading DOCX preview...</p>`;
   try {
-    const resp = await fetch(`/api/docx-preview/${jobId}`);
-    if (!resp.ok) { docxDiv.innerHTML = `<p class="muted">Preview unavailable.</p>`; return; }
-    const data = await resp.json();
-
-    let html = "";
-
-    // Render paragraphs and tables interleaved (paragraphs first, then tables)
-    for (const p of data.paragraphs) {
-      const style = p.style.toLowerCase();
-      if (style.startsWith("heading")) {
-        const level = style.replace("heading ", "").replace("heading", "1");
-        html += `<div class="docx-heading h${level}">${esc(p.text)}</div>`;
-      } else {
-        html += `<div class="docx-para">${esc(p.text)}</div>`;
-      }
+    // Fetch the actual .docx binary from the download endpoint
+    const resp = await fetch(`/api/download/${jobId}`);
+    if (!resp.ok) {
+      docxDiv.innerHTML = `<p class="muted">Preview unavailable.</p>`;
+      return;
     }
+    const arrayBuffer = await resp.arrayBuffer();
 
-    for (const t of data.tables) {
-      html += `<table class="docx-table">`;
-      for (let r = 0; r < t.rows.length; r++) {
-        html += `<tr>`;
-        const tag = r === 0 ? "th" : "td";
-        for (const cell of t.rows[r]) {
-          html += `<${tag}>${esc(cell)}</${tag}>`;
+    // Clear container and render with docx-preview library
+    docxDiv.innerHTML = "";
+    await docx.renderAsync(arrayBuffer, docxDiv, null, {
+      className: "docx",
+      inWrapper: true,
+      ignoreWidth: false,
+      ignoreHeight: false,
+      ignoreFonts: false,
+      breakPages: true,
+      ignoreLastRenderedPageBreak: false,
+      renderHeaders: true,
+      renderFooters: true,
+      renderFootnotes: true,
+      renderEndnotes: true,
+      useBase64URL: true,
+    });
+
+    // Auto-scale rendered pages to fit the container width
+    const wrapper = docxDiv.querySelector(".docx-wrapper");
+    if (wrapper) {
+      const sections = wrapper.querySelectorAll("section.docx");
+      const containerW = docxDiv.clientWidth - 20;
+      sections.forEach((sec) => {
+        const pageW = sec.offsetWidth;
+        if (pageW > containerW && pageW > 0) {
+          const scale = containerW / pageW;
+          sec.style.transform = `scale(${scale})`;
+          sec.style.transformOrigin = "top left";
+          sec.style.marginBottom = `-${sec.offsetHeight * (1 - scale)}px`;
         }
-        html += `</tr>`;
-      }
-      html += `</table>`;
+      });
     }
-
-    if (!html) html = `<p class="muted">No content extracted.</p>`;
-    docxDiv.innerHTML = html;
-  } catch {
-    docxDiv.innerHTML = `<p class="muted">Preview failed.</p>`;
+  } catch (err) {
+    console.error("DOCX preview error:", err);
+    docxDiv.innerHTML = `<p class="muted">Preview failed: ${esc(err.message || "unknown error")}</p>`;
   }
 }
 
@@ -335,6 +482,8 @@ async function loadHistory() {
         : new Date(j.created_at).toLocaleString();
       const score = j.quality_report?.quality_score;
       const scoreHtml = score != null ? `<span class="quality-badge quality-${(j.quality_report?.quality_level || "").toLowerCase()}">${score}/100</span>` : "";
+      const engine = j.settings_summary?.engine === "pdf2docx_lib" ? "pdf2docx" : "custom";
+      const engineHtml = `<span class="meta-chip">${engine}</span>`;
       let actions = "";
       if (j.status === "complete") {
         actions = `<button class="btn btn-small" onclick="downloadJob('${j.id}')">Download</button>`;
@@ -342,12 +491,15 @@ async function loadHistory() {
       return `<div class="history-row">
         <span class="job-status ${statusCls}" style="font-size:.72rem">${j.status}</span>
         <span class="name" title="${esc(j.original_filename)}">${esc(j.original_filename)}</span>
+        ${engineHtml}
         ${scoreHtml}
         <span class="time">${time}</span>
         ${actions}
       </div>`;
     }).join("");
-  } catch {}
+  } catch {
+    showFeedback("Unable to refresh conversion history right now.", "warn", 5000);
+  }
 }
 
 refreshHistory.addEventListener("click", loadHistory);
@@ -365,11 +517,51 @@ function formatSize(bytes) {
   return (bytes / 1048576).toFixed(1) + " MB";
 }
 
+function showFeedback(message, type = "info", durationMs = 4500) {
+  if (feedbackTimer) {
+    clearTimeout(feedbackTimer);
+    feedbackTimer = null;
+  }
+  feedbackArea.hidden = false;
+  feedbackArea.className = `feedback ${type}`;
+  feedbackArea.textContent = message;
+  if (durationMs > 0) {
+    feedbackTimer = setTimeout(() => {
+      feedbackArea.hidden = true;
+      feedbackArea.textContent = "";
+    }, durationMs);
+  }
+}
+
+function updateConvertState() {
+  const hasFiles = pendingFiles.length > 0;
+  const aiEnabled = settingAiEnhance.checked;
+  const hasGeminiKey = settingGeminiKey.value.trim().length > 0;
+  const aiValid = !aiEnabled || hasGeminiKey;
+
+  convertBtn.disabled = !hasFiles || !aiValid;
+  settingGeminiKey.classList.toggle("invalid", aiEnabled && !hasGeminiKey);
+  aiKeyHint.hidden = !(aiEnabled && !hasGeminiKey);
+
+  if (!hasFiles) {
+    convertHint.textContent = "Add at least one PDF file to start conversion.";
+  } else if (!aiValid) {
+    convertHint.textContent = "Gemini API Key is required when AI Enhancement is enabled.";
+  } else {
+    convertHint.textContent = "Ready to convert.";
+  }
+}
+
 // ── Init ────────────────────────────────────────────────────────────
 loadHistory();
 
-// Toggle API key section visibility when AI compare checkbox changes
-document.getElementById("settingAiCompare").addEventListener("change", (e) => {
-  const aiKeySection = document.getElementById("aiKeySection");
+// Toggle API key section visibility when AI enhancement checkbox changes
+settingAiEnhance.addEventListener("change", (e) => {
   aiKeySection.style.display = e.target.checked ? "block" : "none";
+  updateConvertState();
 });
+
+settingGeminiKey.addEventListener("input", updateConvertState);
+aiKeySection.style.display = settingAiEnhance.checked ? "block" : "none";
+applyStyleBtn.addEventListener("click", applyStylePrompt);
+updateConvertState();

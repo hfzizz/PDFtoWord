@@ -16,7 +16,7 @@ import docx.opc.constants
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor, Emu
 from docx.enum.section import WD_ORIENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
 from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
@@ -379,6 +379,19 @@ class DocxBuilder:
         if indent_left > 0:
             para.paragraph_format.left_indent = Pt(indent_left)
 
+        # First-line indent (e.g. indented opening line of a paragraph).
+        first_line_indent = formatting.get("first_line_indent", 0)
+        if first_line_indent > 0:
+            para.paragraph_format.first_line_indent = Pt(first_line_indent)
+
+        # Line spacing ratio (1.0 = single, 1.5, 2.0, etc.).
+        line_spacing = formatting.get("line_spacing")
+        if line_spacing is not None:
+            from docx.shared import Pt as _Pt  # noqa: F811 — already imported
+            # python-docx Pt() for exact spacing or a ratio for proportional.
+            # Use proportional (ratio × 240 twips-per-line).
+            para.paragraph_format.line_spacing = float(line_spacing)
+
         # Look up formatting overrides for this paragraph's text.
         override = self._get_override(text) if self._formatting_overrides else {}
 
@@ -539,6 +552,11 @@ class DocxBuilder:
                 if bg_color:
                     self._set_cell_shading(cell, bg_color)
 
+                # --- Cell borders (per-side width & colour) ----------------
+                borders = cs.get("borders")
+                if borders:
+                    self._set_cell_borders(cell, borders)
+
                 # --- Cell text alignment (vertical) ------------------------
                 v_align = cs.get("v_alignment")
                 if v_align == "center":
@@ -689,16 +707,25 @@ class DocxBuilder:
         para.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     def _add_page_break(self, element: Dict[str, Any]) -> None:
-        """Insert a page break, optionally changing orientation."""
+        """Insert a page break, optionally changing orientation and margins."""
         orientation = element.get("orientation")
         if orientation and self._doc is not None:
             # Add a new section with the appropriate orientation
             new_section = self._doc.add_section()
-            margin = Inches(self._default_margin)
-            new_section.top_margin = margin
-            new_section.bottom_margin = margin
-            new_section.left_margin = margin
-            new_section.right_margin = margin
+
+            # --- per-page margins (from PDF content bounding boxes) --------
+            margins = element.get("margins")
+            if margins:
+                new_section.top_margin = Emu(int(margins["top"] * _PT_TO_EMU))
+                new_section.bottom_margin = Emu(int(margins["bottom"] * _PT_TO_EMU))
+                new_section.left_margin = Emu(int(margins["left"] * _PT_TO_EMU))
+                new_section.right_margin = Emu(int(margins["right"] * _PT_TO_EMU))
+            else:
+                margin = Inches(self._default_margin)
+                new_section.top_margin = margin
+                new_section.bottom_margin = margin
+                new_section.left_margin = margin
+                new_section.right_margin = margin
 
             if orientation == "landscape":
                 new_section.orientation = WD_ORIENT.LANDSCAPE
@@ -760,6 +787,48 @@ class DocxBuilder:
         shading.set(qn("w:val"), "clear")
         shading.set(qn("w:color"), "auto")
         shading.set(qn("w:fill"), hex_color)
+
+    # ------------------------------------------------------------------
+    # Cell border helper  (inspired by pdf2docx library)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _set_cell_borders(cell: Any, borders: Dict[str, Any]) -> None:
+        """Apply per-side border styles to a table cell.
+
+        *borders* is a dict with optional keys ``"top"``, ``"bottom"``,
+        ``"left"``, ``"right"``, each mapping to
+        ``{"width": float, "color": (r, g, b)}``.
+        """
+        if not borders:
+            return
+
+        tc_pr = cell._element.get_or_add_tcPr()
+        tc_borders = tc_pr.find(qn("w:tcBorders"))
+        if tc_borders is None:
+            tc_borders = OxmlElement("w:tcBorders")
+            tc_pr.append(tc_borders)
+
+        for side in ("top", "bottom", "left", "right"):
+            info = borders.get(side)
+            if info is None:
+                continue
+            width_pt = info.get("width", 0.5)
+            color_rgb = info.get("color", (0, 0, 0))
+
+            border_el = OxmlElement(f"w:{side}")
+            border_el.set(qn("w:val"), "single")
+            # Word border size is in 1/8 of a point.
+            sz = max(2, int(width_pt * 8))
+            border_el.set(qn("w:sz"), str(sz))
+            border_el.set(qn("w:space"), "0")
+            hex_color = (
+                f"{int(color_rgb[0]):02X}"
+                f"{int(color_rgb[1]):02X}"
+                f"{int(color_rgb[2]):02X}"
+            )
+            border_el.set(qn("w:color"), hex_color)
+            tc_borders.append(border_el)
 
     # ------------------------------------------------------------------
     # Hyperlink helper
@@ -902,6 +971,20 @@ class DocxBuilder:
         if strikethrough:
             run.font.strike = True
 
+        # Superscript
+        superscript = formatting.get("superscript")
+        if superscript:
+            run.font.superscript = True
+
+        # Highlight colour (from filled rectangles behind text in PDF)
+        highlight_color = formatting.get("highlight_color")
+        if highlight_color and isinstance(highlight_color, (list, tuple)) and len(highlight_color) == 3:
+            # python-docx supports named highlight colours only; map the
+            # RGB to the closest WD_COLOR_INDEX constant.
+            hl_enum = self._closest_highlight(highlight_color)
+            if hl_enum is not None:
+                run.font.highlight_color = hl_enum
+
         # Color: override takes priority.
         color = None
         if override and "font_color" in override:
@@ -933,3 +1016,49 @@ class DocxBuilder:
         if bullet_type == "number":
             return _NUMBER_PREFIX_RE.sub("", text, count=1)
         return _BULLET_PREFIX_RE.sub("", text, count=1)
+
+    # ------------------------------------------------------------------
+    # Highlight colour mapping
+    # ------------------------------------------------------------------
+
+    # Word supports only a fixed palette of highlight colours.
+    _HIGHLIGHT_PALETTE: List = [
+        ((255, 255, 0),   WD_COLOR_INDEX.YELLOW),
+        ((0, 255, 0),     WD_COLOR_INDEX.BRIGHT_GREEN),
+        ((0, 255, 255),   WD_COLOR_INDEX.TURQUOISE),
+        ((255, 0, 255),   WD_COLOR_INDEX.PINK),
+        ((0, 0, 255),     WD_COLOR_INDEX.BLUE),
+        ((255, 0, 0),     WD_COLOR_INDEX.RED),
+        ((0, 0, 128),     WD_COLOR_INDEX.DARK_BLUE),
+        ((0, 128, 128),   WD_COLOR_INDEX.TEAL),
+        ((0, 128, 0),     WD_COLOR_INDEX.GREEN),
+        ((128, 0, 128),   WD_COLOR_INDEX.VIOLET),
+        ((128, 0, 0),     WD_COLOR_INDEX.DARK_RED),
+        ((128, 128, 0),   WD_COLOR_INDEX.DARK_YELLOW),
+        ((128, 128, 128), WD_COLOR_INDEX.GRAY_50),
+        ((192, 192, 192), WD_COLOR_INDEX.GRAY_25),
+    ]
+
+    @staticmethod
+    def _closest_highlight(rgb: tuple) -> Any:
+        """Map an RGB colour to the nearest ``WD_COLOR_INDEX`` member.
+
+        Returns ``None`` if the colour is too dark or neutral to be a
+        meaningful highlight.
+        """
+        r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
+        # Skip very dark colours — they don't work as highlights.
+        if r + g + b < 150:
+            return None
+
+        best_dist = float("inf")
+        best_idx = None
+        for pal_rgb, pal_enum in DocxBuilder._HIGHLIGHT_PALETTE:
+            dr = r - pal_rgb[0]
+            dg = g - pal_rgb[1]
+            db = b - pal_rgb[2]
+            dist = dr * dr + dg * dg + db * db
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = pal_enum
+        return best_idx

@@ -175,6 +175,9 @@ class TableExtractor:
         bbox = table.bbox
         tbl_rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
 
+        # Pre-process page drawings for efficient border detection.
+        h_lines, v_lines = TableExtractor._collect_page_lines(page)
+
         styles: list[list[dict[str, Any]]] = []
 
         for r_idx in range(num_rows):
@@ -215,6 +218,13 @@ class TableExtractor:
                     )
                     if text_info:
                         cell_style.update(text_info)
+
+                    # --- Cell border detection ---------------------------------
+                    borders = TableExtractor._match_border(
+                        cell_rect, h_lines, v_lines
+                    )
+                    if borders:
+                        cell_style["borders"] = borders
 
                     # For collapsed tables the approximate cell rects may
                     # span multiple visual cells, producing garbled run
@@ -380,6 +390,123 @@ class TableExtractor:
         except Exception:
             logger.debug("Cell text extraction failed", exc_info=True)
         return info
+
+    # ------------------------------------------------------------------
+    # Border detection helpers  (inspired by pdf2docx library)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _collect_page_lines(
+        page: fitz.Page,
+    ) -> tuple[list[tuple[float, float, float, float, tuple[int, int, int]]],
+               list[tuple[float, float, float, float, tuple[int, int, int]]]]:
+        """Pre-process page drawings into horizontal and vertical segments.
+
+        Extracts line and rectangle-edge strokes from the page's drawing
+        commands once so that border matching per cell is cheap.
+
+        Returns ``(h_lines, v_lines)`` where each entry is
+        ``(start, end, pos, width, (r, g, b))``:
+        - *h_lines*: ``(x0, x1, y, stroke_width, rgb)``
+        - *v_lines*: ``(y0, y1, x, stroke_width, rgb)``
+        """
+        h_lines: list[tuple[float, float, float, float, tuple[int, int, int]]] = []
+        v_lines: list[tuple[float, float, float, float, tuple[int, int, int]]] = []
+        tolerance = 2.0
+
+        try:
+            drawings = page.get_drawings()
+        except Exception:
+            return h_lines, v_lines
+
+        for d in drawings:
+            stroke_color = d.get("color")
+            if stroke_color is None:
+                continue
+            stroke_width = d.get("width", 1.0)
+            rgb = (
+                int(stroke_color[0] * 255),
+                int(stroke_color[1] * 255),
+                int(stroke_color[2] * 255),
+            )
+
+            for item in d.get("items", []):
+                kind = item[0]
+                if kind == "l":  # line segment
+                    p1, p2 = fitz.Point(item[1]), fitz.Point(item[2])
+                    if abs(p1.y - p2.y) <= tolerance:
+                        h_lines.append((
+                            min(p1.x, p2.x), max(p1.x, p2.x),
+                            (p1.y + p2.y) / 2, stroke_width, rgb,
+                        ))
+                    elif abs(p1.x - p2.x) <= tolerance:
+                        v_lines.append((
+                            min(p1.y, p2.y), max(p1.y, p2.y),
+                            (p1.x + p2.x) / 2, stroke_width, rgb,
+                        ))
+                elif kind == "re":  # rectangle → 4 edges
+                    rect = fitz.Rect(item[1])
+                    if rect.width < 0.5 or rect.height < 0.5:
+                        continue
+                    h_lines.append((rect.x0, rect.x1, rect.y0, stroke_width, rgb))
+                    h_lines.append((rect.x0, rect.x1, rect.y1, stroke_width, rgb))
+                    v_lines.append((rect.y0, rect.y1, rect.x0, stroke_width, rgb))
+                    v_lines.append((rect.y0, rect.y1, rect.x1, stroke_width, rgb))
+
+        return h_lines, v_lines
+
+    @staticmethod
+    def _match_border(
+        cell_rect: fitz.Rect,
+        h_lines: list[tuple[float, float, float, float, tuple[int, int, int]]],
+        v_lines: list[tuple[float, float, float, float, tuple[int, int, int]]],
+    ) -> dict[str, dict[str, Any]]:
+        """Match pre-processed line segments to cell edges.
+
+        For each side of *cell_rect*, finds the closest line that is
+        aligned with and overlaps that edge.
+
+        Returns a dict with optional keys ``"top"``, ``"bottom"``,
+        ``"left"``, ``"right"``, each mapping to
+        ``{"width": float, "color": (r, g, b)}``.
+        """
+        borders: dict[str, dict[str, Any]] = {}
+        tol = 3.0
+        cx0, cy0, cx1, cy1 = (
+            cell_rect.x0, cell_rect.y0, cell_rect.x1, cell_rect.y1,
+        )
+        cell_w = cx1 - cx0
+        cell_h = cy1 - cy0
+
+        # --- horizontal edges (top / bottom) -------------------------------
+        for edge_y, side in ((cy0, "top"), (cy1, "bottom")):
+            best_dist = tol + 1
+            best_info = None
+            for x0, x1, y, w, c in h_lines:
+                dist = abs(y - edge_y)
+                if dist <= tol and dist < best_dist:
+                    overlap = min(x1, cx1) - max(x0, cx0)
+                    if cell_w > 0 and overlap / cell_w > 0.3:
+                        best_dist = dist
+                        best_info = {"width": w, "color": c}
+            if best_info:
+                borders[side] = best_info
+
+        # --- vertical edges (left / right) ---------------------------------
+        for edge_x, side in ((cx0, "left"), (cx1, "right")):
+            best_dist = tol + 1
+            best_info = None
+            for y0, y1, x, w, c in v_lines:
+                dist = abs(x - edge_x)
+                if dist <= tol and dist < best_dist:
+                    overlap = min(y1, cy1) - max(y0, cy0)
+                    if cell_h > 0 and overlap / cell_h > 0.3:
+                        best_dist = dist
+                        best_info = {"width": w, "color": c}
+            if best_info:
+                borders[side] = best_info
+
+        return borders
 
     # ------------------------------------------------------------------
     # Empty-column collapsing

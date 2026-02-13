@@ -120,7 +120,17 @@ class SemanticAnalyzer:
                 # Determine orientation for the upcoming page.
                 _pg_meta = pages_meta[page_num] if page_num < len(pages_meta) else {}
                 _orientation = "landscape" if _pg_meta.get("is_landscape") else "portrait"
-                elements.append({"type": "page_break", "page_num": page_num, "orientation": _orientation})
+                _page_break: dict[str, Any] = {
+                    "type": "page_break",
+                    "page_num": page_num,
+                    "orientation": _orientation,
+                }
+                # Attach per-page margins so the builder can create a
+                # properly sized section for each page.
+                _pg_margins = _pg_meta.get("margins")
+                if _pg_margins:
+                    _page_break["margins"] = _pg_margins
+                elements.append(_page_break)
             prev_page = page_num
 
             # Page dimensions for layout / alignment.
@@ -386,6 +396,8 @@ class SemanticAnalyzer:
                 "color": blk.get("color", (0, 0, 0)),
                 "underline": bool(blk.get("underline", False)),
                 "strikethrough": bool(blk.get("strikethrough", False)),
+                "superscript": bool(blk.get("superscript", False)),
+                "highlight_color": blk.get("highlight_color"),
                 "x0": blk.get("x0", 0),
                 "y0": blk.get("y0", 0),
                 "x1": blk.get("x1", 0),
@@ -407,24 +419,59 @@ class SemanticAnalyzer:
         if indent_left < 5.0:
             indent_left = 0.0
 
+        # --- Line spacing (ratio relative to font size) -------------------
+        # Inspired by pdf2docx: compute spacing between consecutive line
+        # baselines within the group and express as a ratio (1.0 = single,
+        # 1.5 = 1.5 spacing, 2.0 = double).
+        line_spacing: float | None = None
+        if len(group) >= 2:
+            gaps: list[float] = []
+            for i in range(1, len(group)):
+                g_y0 = group[i].get("y0", 0)
+                p_y0 = group[i - 1].get("y0", 0)
+                gap = g_y0 - p_y0
+                if gap > 0:
+                    gaps.append(gap)
+            if gaps and size > 0:
+                avg_gap = sum(gaps) / len(gaps)
+                ratio = round(avg_gap / size, 1)
+                # Only store meaningful ratios (0.8 – 3.0).
+                if 0.8 <= ratio <= 3.0 and abs(ratio - 1.0) > 0.15:
+                    line_spacing = ratio
+
+        # --- First-line indent detection -----------------------------------
+        # If the first line starts noticeably to the right of subsequent
+        # lines, treat the difference as a first-line indent.
+        first_line_indent: float = 0.0
+        if len(group) >= 2:
+            first_x0 = group[0].get("x0", 0)
+            rest_x0s = [b.get("x0", 0) for b in group[1:]]
+            avg_rest_x0 = sum(rest_x0s) / len(rest_x0s)
+            diff = first_x0 - avg_rest_x0
+            if diff > 8.0:  # at least ~8 pt indent
+                first_line_indent = diff
+
         # Check for heading.
         heading_level = heading_lookup.get((clean_font, size))
         if heading_level is not None:
+            fmt_heading: dict[str, Any] = {
+                "font": fallback_font,
+                "size": size,
+                "bold": is_bold,
+                "italic": is_italic,
+                "color": color,
+                "alignment": alignment,
+                "spacing_before": spacing_before,
+                "indent_left": indent_left,
+            }
+            if line_spacing is not None:
+                fmt_heading["line_spacing"] = line_spacing
             return {
                 "type": "heading",
                 "level": heading_level,
                 "text": merged_text,
                 "page_num": page_num,
-                "formatting": {
-                    "font": fallback_font,
-                    "size": size,
-                    "bold": is_bold,
-                    "italic": is_italic,
-                    "color": color,
-                    "alignment": alignment,
-                    "spacing_before": spacing_before,
-                    "indent_left": indent_left,
-                },
+                "formatting": fmt_heading,
                 "_y0": y0,
                 "_x0": x0,
             }
@@ -447,27 +494,35 @@ class SemanticAnalyzer:
                     "alignment": alignment,
                     "spacing_before": spacing_before,
                     "indent_left": indent_left,
+                    **({
+                        "line_spacing": line_spacing,
+                    } if line_spacing is not None else {}),
                 },
                 "_y0": y0,
                 "_x0": x0,
             }
 
         # Default: paragraph.
+        fmt_para: dict[str, Any] = {
+            "font": fallback_font,
+            "size": size,
+            "bold": is_bold,
+            "italic": is_italic,
+            "color": color,
+            "alignment": alignment,
+            "spacing_before": spacing_before,
+            "indent_left": indent_left,
+        }
+        if line_spacing is not None:
+            fmt_para["line_spacing"] = line_spacing
+        if first_line_indent > 0:
+            fmt_para["first_line_indent"] = first_line_indent
         return {
             "type": "paragraph",
             "text": merged_text,
             "runs": runs,
             "page_num": page_num,
-            "formatting": {
-                "font": fallback_font,
-                "size": size,
-                "bold": is_bold,
-                "italic": is_italic,
-                "color": color,
-                "alignment": alignment,
-                "spacing_before": spacing_before,
-                "indent_left": indent_left,
-            },
+            "formatting": fmt_para,
             "_y0": y0,
             "_x0": x0,
         }

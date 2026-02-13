@@ -6,3 +6,4 @@ tqdm>=4.66.0
 flask>=3.0.0
 scikit-image>=0.24.0
 google-genai>=1.0.0
+pdf2docx>=0.5.8

@@ -7,8 +7,23 @@
   "table_detection": "auto",
   "heading_detection": "both",
   "skip_watermarks": false,
+  "conversion_engine": "custom",
   "verbose": false,
   "fallback_font": "Arial",
   "max_image_dpi": 300,
-  "skip_ocr_if_no_tesseract": true
+  "skip_ocr_if_no_tesseract": true,
+  "quality": {
+    "mode": "basic",
+    "gate": "warn",
+    "min_score": 70,
+    "use_visual": false,
+    "min_visual_ssim": 0.88,
+    "engine_fallback": false
+  },
+  "ai_comparison": {
+    "enabled": false,
+    "strategy": "B",
+    "model": "gemini-2.0-flash",
+    "max_rounds": 3
+  }
 }

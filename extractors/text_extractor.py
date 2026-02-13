@@ -108,12 +108,18 @@ class TextExtractor:
                                 "page_num": page_num,
                                 "underline": False,
                                 "strikethrough": False,
+                                "superscript": bool(flags & self._SUPERSCRIPT),
+                                "highlight_color": None,
                             }
                         )
 
             # Detect underline/strikethrough by checking for horizontal
             # line drawings that overlap text spans.
             self._detect_underline_strikethrough(page, results)
+
+            # Detect text highlights from filled rectangles that overlap
+            # text spans (e.g. yellow/green/pink highlight boxes).
+            self._detect_highlights(page, results)
 
             return results
 
@@ -174,6 +180,69 @@ class TextExtractor:
                     span["underline"] = True
                 else:
                     span["strikethrough"] = True
+
+    @staticmethod
+    def _detect_highlights(
+        page: fitz.Page, spans: list[dict[str, Any]]
+    ) -> None:
+        """Detect text highlighting from filled rectangles overlapping text.
+
+        Many PDFs render highlights as coloured filled rectangles drawn
+        behind the text.  This method inspects drawing commands for such
+        rectangles and, when one substantially overlaps a text span,
+        records its colour in ``span["highlight_color"]``.
+
+        Modifies *spans* in place.
+        """
+        if not spans:
+            return
+        try:
+            drawings = page.get_drawings()
+        except Exception:
+            return
+
+        # Collect filled rectangles (skip page-sized or pure-white fills).
+        fill_rects: list[tuple[fitz.Rect, tuple[int, int, int]]] = []
+        for d in drawings:
+            fill = d.get("fill")
+            if fill is None:
+                continue
+            d_rect = d.get("rect")
+            if d_rect is None:
+                continue
+            dr = fitz.Rect(d_rect)
+            # Skip very large fills (likely page backgrounds).
+            if dr.width > 400 and dr.height > 400:
+                continue
+            r = int(fill[0] * 255)
+            g = int(fill[1] * 255)
+            b = int(fill[2] * 255)
+            # Skip white / near-white fills.
+            if r > 240 and g > 240 and b > 240:
+                continue
+            # Skip near-black fills (unlikely highlights).
+            if r < 15 and g < 15 and b < 15:
+                continue
+            fill_rects.append((dr, (r, g, b)))
+
+        if not fill_rects:
+            return
+
+        for span in spans:
+            bbox = span.get("bbox", (0, 0, 0, 0))
+            span_rect = fitz.Rect(bbox)
+            span_area = span_rect.width * span_rect.height
+            if span_area <= 0:
+                continue
+            for fr, color in fill_rects:
+                overlap = fr & span_rect  # intersection
+                if overlap.is_empty:
+                    continue
+                overlap_area = overlap.width * overlap.height
+                # The fill must cover most of the text span.
+                if overlap_area / span_area > 0.5:
+                    span["highlight_color"] = color
+                    break
 
     def extract_links(self, page: fitz.Page, page_num: int = 0) -> list[dict[str, Any]]:
         """Extract hyperlinks from *page*.

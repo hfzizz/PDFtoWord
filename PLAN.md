@@ -184,6 +184,7 @@ Logos and icons with transparent backgrounds appear with solid black fills. Thre
   "table_detection": "auto",
   "heading_detection": "both",
   "skip_watermarks": false,
+    "conversion_engine": "custom",
   "verbose": false,
   "fallback_font": "Arial",
   "max_image_dpi": 300,
@@ -195,7 +196,8 @@ AI and visual diff settings are configured via CLI flags and environment variabl
 
 - `GEMINI_API_KEY` — API key for Gemini vision (enables AI strategies)
 - `--visual-validate` — Enable SSIM scoring after conversion
-- `--ai-compare` — Enable AI comparison/analysis
+- `--use-pdf2docx-lib` — Use external `pdf2docx` library engine (switch OFF = custom engine)
+- `--ai-enhance` — Enable AI-powered enhancement (`--ai-compare` alias kept for compatibility)
 - `--ai-strategy A|B` — Select correction strategy
 
 ---
@@ -225,10 +227,10 @@ python pdf2docx.py input.pdf
 python pdf2docx.py input.pdf --visual-validate
 
 # AI-guided build (Strategy B, recommended)
-python pdf2docx.py input.pdf --visual-validate --ai-compare --ai-strategy B
+python pdf2docx.py input.pdf --visual-validate --ai-enhance --ai-strategy B
 
 # Post-build correction loop (Strategy A)
-python pdf2docx.py input.pdf --visual-validate --ai-compare --ai-strategy A
+python pdf2docx.py input.pdf --visual-validate --ai-enhance --ai-strategy A
 
 # Web UI
 python -m web.app

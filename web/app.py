@@ -15,6 +15,7 @@ from web.services.converter import ConverterService       # noqa: E402
 from web.routes.upload import upload_bp, init_upload       # noqa: E402
 from web.routes.status import status_bp, init_status       # noqa: E402
 from web.routes.download import download_bp, init_download # noqa: E402
+from web.routes.style import style_bp, init_style          # noqa: E402
 
 
 def create_app() -> Flask:
@@ -34,11 +35,13 @@ def create_app() -> Flask:
     init_upload(converter)
     init_status(converter)
     init_download(converter)
+    init_style(converter)
 
     # Register blueprints.
     app.register_blueprint(upload_bp)
     app.register_blueprint(status_bp)
     app.register_blueprint(download_bp)
+    app.register_blueprint(style_bp)
 
     # ── Front-end routes ─────────────────────────────────────────────
     @app.route("/")
